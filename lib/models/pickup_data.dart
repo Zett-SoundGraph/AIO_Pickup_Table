@@ -37,12 +37,14 @@ class TofObject {
 // 전체 JSON 데이터를 감싸는 큰 그릇 (Timestamp + 객체 리스트)
 class TofFrame {
   final String eventType;
+  final double? baseZ;
   final String timestamp;
   final int frameId;
   final List<TofObject> objects; // 여러 개의 컵을 담을 리스트
 
   TofFrame({
     required this.eventType,
+    required this.baseZ,
     required this.timestamp,
     required this.frameId,
     required this.objects,
@@ -54,6 +56,7 @@ class TofFrame {
 
     return TofFrame(
       eventType: json['event_type'] ?? 'unknown',
+      baseZ: (json['base_z'] as num?)?.toDouble() ?? 1000.0,
       timestamp: json['timestamp'] ?? DateTime.now().toIso8601String(),
       frameId: json['frame_id'] as int? ?? 0,
       objects: objectList,
