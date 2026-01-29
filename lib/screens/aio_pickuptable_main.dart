@@ -3,7 +3,8 @@ import 'dart:convert';
 import 'dart:io';
   import 'dart:math';
 import 'dart:math' as math;
-  import 'package:flutter/material.dart';
+  import 'package:aio_pickup_table/components/guide_circle.dart';
+import 'package:flutter/material.dart';
   import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
@@ -14,6 +15,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../components/arc_text_painter.dart';
 import '../services/coordinate_transformer.dart';
 import '../services/homography_solver.dart';
+import '../services/order_manager.dart';
 import '../services/socket_server_service.dart';
   import '../models/pickup_data.dart';
   import '../config/app_constants.dart';
@@ -84,18 +86,15 @@ import 'calibration_screen.dart';
     String _currentTimeStr = "00:00:00";
     Timer? _clockTimer;
 
-    final List<Color> _idPalette = [
-      Colors.cyanAccent,     // 0
-      Colors.greenAccent,    // 1
-      Colors.yellowAccent,   // 2
-      Colors.orangeAccent,   // 3
-      Colors.pinkAccent,     // 4
-      Colors.purpleAccent,   // 5
-      Colors.blueAccent,     // 6
-      Colors.limeAccent,     // 7
-      Colors.amberAccent,    // 8
-      Colors.tealAccent,     // 9
-    ];
+    final List<Color> _idPalette = List.generate(100, (index) {
+      double hue = (index * 137.508) % 360;
+
+      double saturation = (index % 2 == 0) ? 0.9 : 0.5;
+
+      double value = 1.0 - ((index % 3) * 0.2);
+
+      return HSVColor.fromAHSV(1.0, hue, saturation, value).toColor();
+    });
 
     int? _currentLatestFrameId;
 
@@ -260,27 +259,39 @@ import 'calibration_screen.dart';
 
         // 4. ROI 역산 및 라즈베리파이 전송
         final Matrix invH = hMatrix.inverse(); // 역행렬 계산
-        Map<String, Offset> roiTargets = {
-          "Top-Left": const Offset(0, 0),
-          "Top-Right": const Offset(1920, 0),
-          "Bottom-Left": const Offset(0, 1080),
-          "Bottom-Right": const Offset(1920, 1080),
-          "Center": const Offset(960, 540),
-        };
+        final List<Map<String, dynamic>> roiConfigs = [
+          {"id": 1, "name": "Top-Left", "pos": const Offset(0, 0)},
+          {"id": 2, "name": "Top-Right", "pos": const Offset(1920, 0)},
+          {"id": 3, "name": "Bottom-Left", "pos": const Offset(0, 1080)},
+          {"id": 4, "name": "Bottom-Right", "pos": const Offset(1920, 1080)},
+          {"id": 5, "name": "Center", "pos": const Offset(960, 540)},
+        ];
 
-        List<Map<String, double>> roiPoints = [];
+        List<Map<String, dynamic>> roiPoints = [];
         _addLog("SYS", "📡 ROI Mapping (UI -> Camera Raw)");
 
-        roiTargets.forEach((name, uiPos) {
+        for (var config in roiConfigs) {
+          final int id = config["id"];
+          final String name = config["name"];
+          final Offset uiPos = config["pos"];
+
+          // 호모그래피 역행렬을 이용한 좌표 변환 공식
+          // x' = (h11*x + h12*y + h13) / (h31*x + h32*y + h33)
           double den = invH[2][0] * uiPos.dx + invH[2][1] * uiPos.dy + invH[2][2];
           double rx = (invH[0][0] * uiPos.dx + invH[0][1] * uiPos.dy + invH[0][2]) / den;
           double ry = (invH[1][0] * uiPos.dx + invH[1][1] * uiPos.dy + invH[1][2]) / den;
 
-          _addLog("ROI", "$name: UI(${uiPos.dx.toInt()}, ${uiPos.dy.toInt()}) ➔ Raw(${rx.toStringAsFixed(1)}, ${ry.toStringAsFixed(1)})");
-          roiPoints.add({"x": rx, "y": ry});
-        });
+          _addLog("ROI", "ID:$id ($name): Raw(${rx.toStringAsFixed(1)}, ${ry.toStringAsFixed(1)})");
 
-        _serverService.sendMessage(jsonEncode({
+          // 전송용 리스트에 ID와 좌표 추가
+          roiPoints.add({
+            "id": id,
+            "x": rx,
+            "y": ry,
+          });
+        }
+
+        _serverService.sendToRole("TOF_SENSOR", jsonEncode({
           "event_type": "set_roi",
           "timestamp": DateTime.now().toIso8601String(),
           "roi_points": roiPoints,
@@ -291,206 +302,375 @@ import 'calibration_screen.dart';
         _addLog("ERR", "Calibration/ROI Error: $e");
       }
     }
-
     void _initializeServer() {
       _serverService = SocketServerService(
-        onLog: (msg) => _addLog("SYS", msg),
-        onDataReceived: (TofFrame frame) {
-          setState(() {
-            _currentLatestFrameId = frame.frameId;
-          });
-          setState(() {
-            if (frame.objects.isNotEmpty) {
-              var obj = frame.objects.first;
-              // [수정] 단순히 obj.x, obj.y가 아니라 시차 보정(Parallax)을 거친 좌표를 전달합니다.
-              _latestRawForCalib = CoordinateTransformer.getParallaxCorrectedOffset(obj.x, obj.y, obj.z);
-            } else {
-              _latestRawForCalib = null;
+          onLog: (msg) => _addLog("SYS", msg),
+          onOrderReceived: () {
+            if (mounted) setState(() => _updateGuidePositions());
+          },
+          onDataReceived: (TofFrame frame) {
+            // 1. 바닥 높이 동기화 이벤트 처리
+            if (frame.eventType == "base_z" && frame.baseZ != null) {
+              CoordinateTransformer.updateFloorHeight(frame.baseZ!);
+              _addLog("SYS", "🎯 기준 바닥 높이 동기화: ${frame.baseZ}mm");
+              return;
             }
-          });
-          if (frame.objects.isNotEmpty) {
-            for (var obj in frame.objects) {
-              // 1. 실제 로직과 동일한 변환 수행
-              Offset calibratedPos = CoordinateTransformer.transform(obj.x, obj.y, obj.z);
 
-              // 2. 변환된 최종 UI 좌표를 로그에 찍도록 수정
-              debugPrint(
-                  "[CALIB] ID:${obj.id} | "
-                      "Raw(${obj.x.toStringAsFixed(1)}, ${obj.y.toStringAsFixed(1)}) "
-                      "-> UI(${calibratedPos.dx.toStringAsFixed(1)}, ${calibratedPos.dy.toStringAsFixed(1)})"
-              );
-            }
-          }
+            // ================= [로그 콘솔 출력 로직 복구] =================
+            bool isChanged = _hasSignificantChange(frame.objects, _lastFrameObjects);
+            bool shouldLog = _showRawData || isChanged;
 
-          // ---------------- [로그 필터링 로직 시작] ----------------
-          // 1. 변화 감지 체크
-          bool isChanged = _hasSignificantChange(frame.objects, _lastFrameObjects);
+            if (shouldLog) {
+              String tag = (!_showRawData && isChanged) ? "MOVE" : "RX";
+              _addLog(tag, "=== Frame: ${frame.frameId} (Count: ${frame.objects.length}) ===", frameId: frame.frameId);
 
-          // 2. 로그 출력 여부 결정 (Raw모드 켜짐 OR 변화 발생 시)
-          bool shouldLog = _showRawData || isChanged;
-
-          if (shouldLog) {
-            // 태그 설정: 변화 때문에 찍힌거면 "MOVE", 아니면 "RX"
-            String tag = (!_showRawData && isChanged) ? "MOVE" : "RX";
-
-            _addLog(
-                tag,
-                "=== Frame: ${frame.frameId} (Count: ${frame.objects.length}) ===",
-                frameId: frame.frameId // ★ 핵심: 여기서 ID를 넘김
-            );
-
-            for (var obj in frame.objects) {
-              // 반지름 계산 (d / 2)
-              double radius = obj.diameter / 2;
-
-              _addLog(
+              for (var obj in frame.objects) {
+                double radius = obj.diameter / 2;
+                _addLog(
                   tag,
-                  "  > [ID:${obj.id}] "
-                      "x:${obj.x.toStringAsFixed(0)}, "
-                      "y:${obj.y.toStringAsFixed(0)}, "
-                      "z:${obj.z.toStringAsFixed(0)}, "
-                      "w:${obj.width.toStringAsFixed(0)}, "  // 가로
-                      "h:${obj.height.toStringAsFixed(0)}, " // 세로
-                      "r:${radius.toStringAsFixed(1)}",      // 반지름
-                frameId: frame.frameId,
-                objectId: obj.id,
-              );
+                  "  > [ID:${obj.id}] x:${obj.x.toStringAsFixed(0)}, y:${obj.y.toStringAsFixed(0)}, z:${obj.z.toStringAsFixed(0)}, w:${obj.width.toStringAsFixed(0)}, h:${obj.height.toStringAsFixed(0)}, r:${radius.toStringAsFixed(1)}",
+                  frameId: frame.frameId,
+                  objectId: obj.id,
+                );
+              }
             }
+            _lastFrameObjects = frame.objects;
+            _currentLatestFrameId = frame.frameId; // 최신 프레임 ID 업데이트 (로그 색상용)
+            // ==========================================================
+
+            setState(() {
+              // 2. 센서 데이터 UI 좌표 변환
+              List<Map<String, dynamic>> sensorInputs = frame.objects.map((tof) => {
+                'id': tof.id,
+                'pos': CoordinateTransformer.transform(tof.x, tof.y, tof.z),
+                'raw': tof
+              }).toList();
+
+              List<DetectedObject> nextObjects = [];
+
+              // 3. 기존 컵 유지 및 근접 매칭 (Spatial Proximity)
+              for (var existing in objects) {
+                int closestIndex = -1;
+                double minDistance = 50.0; // 50px 이내로 판정 (필요시 조정)
+
+                for (int i = 0; i < sensorInputs.length; i++) {
+                  double dist = (existing.position - (sensorInputs[i]['pos'] as Offset)).distance;
+                  if (dist < minDistance) {
+                    minDistance = dist;
+                    closestIndex = i;
+                  }
+                }
+
+                if (closestIndex != -1) {
+                  var matched = sensorInputs.removeAt(closestIndex);
+                  var tof = matched['raw'] as TofObject;
+
+                  // ID가 바뀌었어도 기존 주문 번호 강제 승계
+                  if (existing.id != matched['id']) {
+                    OrderManager.releaseId(existing.id);
+                    OrderManager.getOrAssignOrder(matched['id'], forceOrderNo: existing.orderNo);
+                  }
+
+                  nextObjects.add(DetectedObject(
+                    id: matched['id'],
+                    orderNo: existing.orderNo,
+                    position: matched['pos'],
+                    zValue: tof.z,
+                    diameter: CoordinateTransformer.getUiDiameter(tof.diameter),
+                    uiWidth: CoordinateTransformer.getUiSize(tof.width, tof.height).width,
+                    uiHeight: CoordinateTransformer.getUiSize(tof.width, tof.height).height,
+                  ));
+                } else {
+                  // 픽업 완료 처리
+                  final removedOrder = OrderManager.releaseId(existing.id);
+                  if (removedOrder != null && removedOrder['orderNo'] != "WAIT") {
+                    _serverService.sendToRole("KDS", jsonEncode({
+                      "type": "PICKUP_COMPLETE",
+                      "orderNo": removedOrder['orderNo'],
+                    }));
+                    _addLog("SYS", "📤 [PICKUP] No.${removedOrder['orderNo']} 완료 전송");
+                  }
+                  exitingObjects.add(existing);
+                }
+              }
+
+              // 4. 신규 컵 추가
+              for (var nuevo in sensorInputs) {
+                var tof = nuevo['raw'] as TofObject;
+                final orderInfo = OrderManager.getOrAssignOrder(tof.id);
+
+                nextObjects.add(DetectedObject(
+                  id: tof.id,
+                  orderNo: orderInfo?['orderNo'] ?? "WAIT",
+                  position: nuevo['pos'],
+                  zValue: tof.z,
+                  diameter: CoordinateTransformer.getUiDiameter(tof.diameter),
+                  uiWidth: CoordinateTransformer.getUiSize(tof.width, tof.height).width,
+                  uiHeight: CoordinateTransformer.getUiSize(tof.width, tof.height).height,
+                ));
+              }
+
+              objects = nextObjects;
+              _updateGuidePositions(); // 가이드 원 위치 갱신
+            });
           }
-
-          // 3. 현재 프레임을 '이전 프레임'으로 저장 (다음 비교를 위해)
-          _lastFrameObjects = frame.objects;
-          // ---------------- [로그 필터링 로직 끝] ----------------
-
-          setState(() {
-            // A. 현재 들어온 데이터를 UI 모델로 미리 변환
-            List<DetectedObject> incomingObjects = frame.objects.map((tofObj) {
-              Offset calibratedPos = CoordinateTransformer.transform(tofObj.x, tofObj.y, tofObj.z);
-              Size uiSize = CoordinateTransformer.getUiSize(tofObj.width, tofObj.height);
-              double uiDiameter = CoordinateTransformer.getUiDiameter(tofObj.diameter);
-              return DetectedObject(
-                id: tofObj.id,
-                orderNo: "${tofObj.id + 100}",
-                position: calibratedPos,
-                zValue: tofObj.z,
-                diameter: uiDiameter,
-                uiWidth: uiSize.width,
-                uiHeight: uiSize.height,
-              );
-            }).toList();
-
-            // B. 기존 ID 기반 업데이트 로직 (센서가 object_removed를 안 보내도 일단 실행)
-            for (int i = 0; i < incomingObjects.length; i++) {
-              var newObj = incomingObjects[i];
-              int index = objects.indexWhere((obj) => obj.id == newObj.id);
-
-              if (index != -1) {
-                objects[index] = newObj; // 기존 객체 업데이트
-              } else if (objects.length < incomingObjects.length) {
-                // ID가 다르더라도 리스트 개수가 늘어나야 하는 상황이면 추가
-                objects.add(newObj);
-              }
-            }
-
-            // C. [핵심 추가] 개수 비교 강제 제거 로직 (Fallback)
-            // 라즈베리파이에서 removed 신호를 안 보내더라도, 리스트 개수 자체가 줄었다면 실행
-            if (objects.length > incomingObjects.length) {
-              int diff = objects.length - incomingObjects.length;
-              _addLog("SYS", "⚠️ 데이터 불일치 감지 (Missing: $diff). 강제 제거를 수행합니다.");
-
-              for (int i = 0; i < diff; i++) {
-                // ID 추적이 안 되므로 리스트의 마지막 객체를 지워 개수를 맞춤
-                DetectedObject targetObj = objects.removeLast();
-                exitingObjects.add(targetObj);
-              }
-            }
-          });
-
-          /// 마지막 번호 원 제거 로직을 위해 잠시 주석처리
-          // ================= [UI 업데이트 로직 (기존 유지)] =================
-          // 수신된 데이터를 UI 모델(DetectedObject)로 변환
-          // List<DetectedObject> incomingObjects = frame.objects.map((tofObj) {
-          //   Offset calibratedPos = CoordinateTransformer.transform(tofObj.x, tofObj.y, tofObj.z);
-          //
-          //   // 가로, 세로 크기 각각 계산
-          //   Size uiSize = CoordinateTransformer.getUiSize(tofObj.width, tofObj.height);
-          //   double uiDiameter = CoordinateTransformer.getUiDiameter(tofObj.diameter);
-          //   return DetectedObject(
-          //     id: tofObj.id,
-          //     orderNo: "${tofObj.id + 100}",
-          //     position: calibratedPos,
-          //     zValue: tofObj.z,
-          //     diameter: uiDiameter,
-          //     uiWidth: uiSize.width,
-          //     uiHeight: uiSize.height,
-          //   );
-          // }).toList();
-
-          // List<DetectedObject> currentObjects = List.from(objects);
-          //
-          // // [Appeared / Update] 처리
-          // if (frame.eventType == "object_update" || frame.eventType == "object_appeared") {
-          //   for (int i = 0; i < incomingObjects.length; i++) {
-          //     var newObj = incomingObjects[i];
-          //     int index = objects.indexWhere((obj) => obj.id == newObj.id);
-          //
-          //     if (index != -1) {
-          //       setState(() { objects[index] = newObj; });
-          //     } else {
-          //       Future.delayed(Duration(milliseconds: i * 150), () {
-          //         if (!mounted) return;
-          //         setState(() {
-          //           if (!objects.any((o) => o.id == newObj.id)) {
-          //             objects.add(newObj);
-          //           }
-          //         });
-          //       });
-          //     }
-          //   }
-          // }
-          // // [Removed] 처리
-          // else if (frame.eventType == "object_removed") {
-          //   for (var delObj in incomingObjects) {
-          //     int index = currentObjects.indexWhere((obj) => obj.id == delObj.id);
-          //     if (index != -1) {
-          //       DetectedObject targetObj = currentObjects[index];
-          //
-          //       // 광고 트리거 로직
-          //       // if (!_isAdPlaying) {
-          //       //   _addLog("EVENT", "Object Removed: ID ${targetObj.id} -> Show AD");
-          //       //   List<Offset> remainingObstacles = currentObjects
-          //       //       .where((o) => o.id != targetObj.id)
-          //       //       .map((e) => e.position).toList();
-          //       //
-          //       //   _videoLayerKey.currentState?.moveVideoToPosition(targetObj.position, remainingObstacles);
-          //       //   Duration adDuration = _videoLayerKey.currentState?.getVideoDuration() ?? const Duration(seconds: 15);
-          //       //
-          //       //   setState(() { _isAdPlaying = true; });
-          //       //   _adTimer?.cancel();
-          //       //   _adTimer = Timer(adDuration, () {
-          //       //     if (mounted) {
-          //       //       setState(() {
-          //       //         _isAdPlaying = false;
-          //       //         _addLog("INFO", "Ad finished. Relocating.");
-          //       //         _videoLayerKey.currentState?.findNextSafePosition();
-          //       //       });
-          //       //     }
-          //       //   });
-          //       // } else {
-          //       //   _addLog("EVENT", "Object Removed: ID ${targetObj.id} (Ad playing, skipped move)");
-          //       // }
-          //
-          //       setState(() {
-          //         exitingObjects.add(targetObj);
-          //         objects.removeAt(index);
-          //       });
-          //     }
-          //   }
-          // }
-        },
       );
       _serverService.startServer();
     }
+    // void _initializeServer() {
+    //   _serverService = SocketServerService(
+    //     onLog: (msg) => _addLog("SYS", msg),
+    //     onDataReceived: (TofFrame frame) {
+    //       setState(() {
+    //         _currentLatestFrameId = frame.frameId;
+    //
+    //         // 1. 현재 들어온 센서 데이터의 ID 목록 추출
+    //         final incomingIds = frame.objects.map((obj) => obj.id).toSet();
+    //
+    //         // 2. [중요] 사라진 컵 처리 (Cleanup)
+    //         // 현재 UI 리스트(objects)에는 있는데, 센서(incomingIds)에는 없다면? -> 컵을 치운 것!
+    //         objects.removeWhere((existingObj) {
+    //           if (!incomingIds.contains(existingObj.id)) {
+    //             // ★ 매니저에게 이 ID의 매칭을 해제하라고 알림
+    //             OrderManager.releaseId(existingObj.id);
+    //
+    //             // 퇴장 애니메이션 리스트에 추가
+    //             exitingObjects.add(existingObj);
+    //             return true; // 리스트에서 삭제
+    //           }
+    //           return false;
+    //         });
+    //
+    //         // 3. [중요] 새로운 컵 추가 또는 기존 컵 위치 업데이트
+    //         for (var tofObj in frame.objects) {
+    //           // ★ 핵심: 매니저에게 주문 정보를 할당받거나 기존 정보를 가져옵니다.
+    //           final orderInfo = OrderManager.getOrAssignOrder(tofObj.id);
+    //
+    //           Offset calibratedPos = CoordinateTransformer.transform(tofObj.x, tofObj.y, tofObj.z);
+    //           Size uiSize = CoordinateTransformer.getUiSize(tofObj.width, tofObj.height);
+    //
+    //           final updatedObj = DetectedObject(
+    //             id: tofObj.id,
+    //             // ★ 매칭된 실제 주문번호를 사용 (없으면 "WAIT")
+    //             orderNo: orderInfo?['orderNo'] ?? "WAIT",
+    //             position: calibratedPos,
+    //             zValue: tofObj.z,
+    //             diameter: CoordinateTransformer.getUiDiameter(tofObj.diameter),
+    //             uiWidth: uiSize.width,
+    //             uiHeight: uiSize.height,
+    //           );
+    //
+    //           // 이미 리스트에 있는 컵이면 업데이트, 없으면 신규 추가
+    //           int index = objects.indexWhere((o) => o.id == tofObj.id);
+    //           if (index != -1) {
+    //             objects[index] = updatedObj;
+    //           } else {
+    //             objects.add(updatedObj);
+    //             _addLog("SYS", "🎯 새로운 컵 감지 및 주문 매칭: ID ${tofObj.id} -> NO.${updatedObj.orderNo}");
+    //           }
+    //         }
+    //       });
+    //
+    //       if (frame.eventType == "base_z" && frame.baseZ != null) {
+    //         CoordinateTransformer.updateFloorHeight(frame.baseZ!);
+    //         _addLog("SYS", "🎯 기준 바닥 높이 동기화 완료: ${frame.baseZ}mm");
+    //         return; // base_z 이벤트는 여기서 처리 종료
+    //       }
+    //       setState(() {
+    //         _currentLatestFrameId = frame.frameId;
+    //       });
+    //       setState(() {
+    //         if (frame.objects.isNotEmpty) {
+    //           var obj = frame.objects.first;
+    //           // [수정] 단순히 obj.x, obj.y가 아니라 시차 보정(Parallax)을 거친 좌표를 전달합니다.
+    //           _latestRawForCalib = CoordinateTransformer.getParallaxCorrectedOffset(obj.x, obj.y, obj.z);
+    //         } else {
+    //           _latestRawForCalib = null;
+    //         }
+    //       });
+    //       if (frame.objects.isNotEmpty) {
+    //         for (var obj in frame.objects) {
+    //           // 1. 실제 로직과 동일한 변환 수행
+    //           Offset calibratedPos = CoordinateTransformer.transform(obj.x, obj.y, obj.z);
+    //
+    //           // 2. 변환된 최종 UI 좌표를 로그에 찍도록 수정
+    //           debugPrint(
+    //               "[CALIB] ID:${obj.id} | "
+    //                   "Raw(${obj.x.toStringAsFixed(1)}, ${obj.y.toStringAsFixed(1)}) "
+    //                   "-> UI(${calibratedPos.dx.toStringAsFixed(1)}, ${calibratedPos.dy.toStringAsFixed(1)})"
+    //           );
+    //         }
+    //       }
+    //
+    //       // ---------------- [로그 필터링 로직 시작] ----------------
+    //       // 1. 변화 감지 체크
+    //       bool isChanged = _hasSignificantChange(frame.objects, _lastFrameObjects);
+    //
+    //       // 2. 로그 출력 여부 결정 (Raw모드 켜짐 OR 변화 발생 시)
+    //       bool shouldLog = _showRawData || isChanged;
+    //
+    //       if (shouldLog) {
+    //         // 태그 설정: 변화 때문에 찍힌거면 "MOVE", 아니면 "RX"
+    //         String tag = (!_showRawData && isChanged) ? "MOVE" : "RX";
+    //
+    //         _addLog(
+    //             tag,
+    //             "=== Frame: ${frame.frameId} (Count: ${frame.objects.length}) ===",
+    //             frameId: frame.frameId // ★ 핵심: 여기서 ID를 넘김
+    //         );
+    //
+    //         for (var obj in frame.objects) {
+    //           // 반지름 계산 (d / 2)
+    //           double radius = obj.diameter / 2;
+    //
+    //           _addLog(
+    //               tag,
+    //               "  > [ID:${obj.id}] "
+    //                   "x:${obj.x.toStringAsFixed(0)}, "
+    //                   "y:${obj.y.toStringAsFixed(0)}, "
+    //                   "z:${obj.z.toStringAsFixed(0)}, "
+    //                   "w:${obj.width.toStringAsFixed(0)}, "  // 가로
+    //                   "h:${obj.height.toStringAsFixed(0)}, " // 세로
+    //                   "r:${radius.toStringAsFixed(1)}",      // 반지름
+    //             frameId: frame.frameId,
+    //             objectId: obj.id,
+    //           );
+    //         }
+    //       }
+    //
+    //       // 3. 현재 프레임을 '이전 프레임'으로 저장 (다음 비교를 위해)
+    //       _lastFrameObjects = frame.objects;
+    //       // ---------------- [로그 필터링 로직 끝] ----------------
+    //
+    //       // setState(() {
+    //       //   // A. 현재 들어온 데이터를 UI 모델로 미리 변환
+    //       //   List<DetectedObject> incomingObjects = frame.objects.map((tofObj) {
+    //       //     Offset calibratedPos = CoordinateTransformer.transform(tofObj.x, tofObj.y, tofObj.z);
+    //       //     Size uiSize = CoordinateTransformer.getUiSize(tofObj.width, tofObj.height);
+    //       //     double uiDiameter = CoordinateTransformer.getUiDiameter(tofObj.diameter);
+    //       //     return DetectedObject(
+    //       //       id: tofObj.id,
+    //       //       orderNo: "${tofObj.id + 100}",
+    //       //       position: calibratedPos,
+    //       //       zValue: tofObj.z,
+    //       //       diameter: uiDiameter,
+    //       //       uiWidth: uiSize.width,
+    //       //       uiHeight: uiSize.height,
+    //       //     );
+    //       //   }).toList();
+    //       //
+    //       //   // B. 기존 ID 기반 업데이트 로직 (센서가 object_removed를 안 보내도 일단 실행)
+    //       //   for (int i = 0; i < incomingObjects.length; i++) {
+    //       //     var newObj = incomingObjects[i];
+    //       //     int index = objects.indexWhere((obj) => obj.id == newObj.id);
+    //       //
+    //       //     if (index != -1) {
+    //       //       objects[index] = newObj; // 기존 객체 업데이트
+    //       //     } else if (objects.length < incomingObjects.length) {
+    //       //       // ID가 다르더라도 리스트 개수가 늘어나야 하는 상황이면 추가
+    //       //       objects.add(newObj);
+    //       //     }
+    //       //   }
+    //       //
+    //       //   // C. [핵심 추가] 개수 비교 강제 제거 로직 (Fallback)
+    //       //   // 라즈베리파이에서 removed 신호를 안 보내더라도, 리스트 개수 자체가 줄었다면 실행
+    //       //   if (objects.length > incomingObjects.length) {
+    //       //     int diff = objects.length - incomingObjects.length;
+    //       //     _addLog("SYS", "⚠️ 데이터 불일치 감지 (Missing: $diff). 강제 제거를 수행합니다.");
+    //       //
+    //       //     for (int i = 0; i < diff; i++) {
+    //       //       // ID 추적이 안 되므로 리스트의 마지막 객체를 지워 개수를 맞춤
+    //       //       DetectedObject targetObj = objects.removeLast();
+    //       //       exitingObjects.add(targetObj);
+    //       //     }
+    //       //   }
+    //       // });
+    //
+    //       /// 마지막 번호 원 제거 로직을 위해 잠시 주석처리
+    //       // ================= [UI 업데이트 로직 (기존 유지)] =================
+    //       // 수신된 데이터를 UI 모델(DetectedObject)로 변환
+    //       // List<DetectedObject> incomingObjects = frame.objects.map((tofObj) {
+    //       //   Offset calibratedPos = CoordinateTransformer.transform(tofObj.x, tofObj.y, tofObj.z);
+    //       //
+    //       //   // 가로, 세로 크기 각각 계산
+    //       //   Size uiSize = CoordinateTransformer.getUiSize(tofObj.width, tofObj.height);
+    //       //   double uiDiameter = CoordinateTransformer.getUiDiameter(tofObj.diameter);
+    //       //   return DetectedObject(
+    //       //     id: tofObj.id,
+    //       //     orderNo: "${tofObj.id + 100}",
+    //       //     position: calibratedPos,
+    //       //     zValue: tofObj.z,
+    //       //     diameter: uiDiameter,
+    //       //     uiWidth: uiSize.width,
+    //       //     uiHeight: uiSize.height,
+    //       //   );
+    //       // }).toList();
+    //
+    //       // List<DetectedObject> currentObjects = List.from(objects);
+    //       //
+    //       // // [Appeared / Update] 처리
+    //       // if (frame.eventType == "object_update" || frame.eventType == "object_appeared") {
+    //       //   for (int i = 0; i < incomingObjects.length; i++) {
+    //       //     var newObj = incomingObjects[i];
+    //       //     int index = objects.indexWhere((obj) => obj.id == newObj.id);
+    //       //
+    //       //     if (index != -1) {
+    //       //       setState(() { objects[index] = newObj; });
+    //       //     } else {
+    //       //       Future.delayed(Duration(milliseconds: i * 150), () {
+    //       //         if (!mounted) return;
+    //       //         setState(() {
+    //       //           if (!objects.any((o) => o.id == newObj.id)) {
+    //       //             objects.add(newObj);
+    //       //           }
+    //       //         });
+    //       //       });
+    //       //     }
+    //       //   }
+    //       // }
+    //       // // [Removed] 처리
+    //       // else if (frame.eventType == "object_removed") {
+    //       //   for (var delObj in incomingObjects) {
+    //       //     int index = currentObjects.indexWhere((obj) => obj.id == delObj.id);
+    //       //     if (index != -1) {
+    //       //       DetectedObject targetObj = currentObjects[index];
+    //       //
+    //       //       // 광고 트리거 로직
+    //       //       // if (!_isAdPlaying) {
+    //       //       //   _addLog("EVENT", "Object Removed: ID ${targetObj.id} -> Show AD");
+    //       //       //   List<Offset> remainingObstacles = currentObjects
+    //       //       //       .where((o) => o.id != targetObj.id)
+    //       //       //       .map((e) => e.position).toList();
+    //       //       //
+    //       //       //   _videoLayerKey.currentState?.moveVideoToPosition(targetObj.position, remainingObstacles);
+    //       //       //   Duration adDuration = _videoLayerKey.currentState?.getVideoDuration() ?? const Duration(seconds: 15);
+    //       //       //
+    //       //       //   setState(() { _isAdPlaying = true; });
+    //       //       //   _adTimer?.cancel();
+    //       //       //   _adTimer = Timer(adDuration, () {
+    //       //       //     if (mounted) {
+    //       //       //       setState(() {
+    //       //       //         _isAdPlaying = false;
+    //       //       //         _addLog("INFO", "Ad finished. Relocating.");
+    //       //       //         _videoLayerKey.currentState?.findNextSafePosition();
+    //       //       //       });
+    //       //       //     }
+    //       //       //   });
+    //       //       // } else {
+    //       //       //   _addLog("EVENT", "Object Removed: ID ${targetObj.id} (Ad playing, skipped move)");
+    //       //       // }
+    //       //
+    //       //       setState(() {
+    //       //         exitingObjects.add(targetObj);
+    //       //         objects.removeAt(index);
+    //       //       });
+    //       //     }
+    //       //   }
+    //       // }
+    //     },
+    //   );
+    //   _serverService.startServer();
+    // }
 
     void _sendTestCommandToPi() {
       // 1. 임시 데이터 생성
@@ -522,7 +702,7 @@ import 'calibration_screen.dart';
 
       // 2. JSON 문자열로 변환하여 RPi로 전송
       String jsonString = jsonEncode(txPacket);
-      _serverService.sendMessage(jsonString);
+      _serverService.sendToRole("TOF_SENSOR", jsonString);
 
       // 3. 로그 출력
       _addLog("TX", "=== Frame: ${txPacket['frame_id']} (Count: ${dummyObjects.length}) ===");
@@ -600,6 +780,30 @@ import 'calibration_screen.dart';
                   //   currentObstacles: objects.map((e) => e.position).toList(),
                   //   onLog: (msg) => debugPrint("[IPS_ANIM] $msg"),
                   // ),
+
+                  ..._guidePositions.entries.map((entry) {
+                    Offset pos = entry.value;
+                    return AnimatedPositioned(
+                      key: ValueKey("guide_${entry.key}"),
+                      duration: const Duration(milliseconds: 500),
+                      curve: Curves.easeInOut,
+                      left: pos.dx - 90, // 지름 180의 절반
+                      top: pos.dy - 90,
+                      child: TweenAnimationBuilder<double>(
+                        tween: Tween(begin: 0.0, end: 1.0),
+                        duration: const Duration(seconds: 1),
+                        builder: (context, val, child) {
+                          return Opacity(
+                            opacity: val * 0.4, // 희미하게 표시
+                            child: CustomPaint(
+                              size: const Size(180, 180),
+                              painter: GuideCircle(), // guide_circle.dart의 클래스명 확인
+                            ),
+                          );
+                        },
+                      ),
+                    );
+                  }).toList(),
 
                   // 3-2. 개별 컵 Glow 및 정보 표시
                   ...objects.map((obj) {
@@ -868,6 +1072,49 @@ import 'calibration_screen.dart';
             }
         ),
       );
+    }
+    final Map<String, Offset> _guidePositions = {};
+    final Random _random = Random();
+
+// [추가] 빈 공간을 찾는 지능형 함수
+    Offset _findSafePosition(List<DetectedObject> currentCups) {
+      int attempts = 0;
+      const double minDistance = 250.0; // 컵과 가이드 사이의 최소 안전 거리
+
+      while (attempts < 50) {
+        double x = _random.nextDouble() * (1920 - 400) + 200; // 가로 범위 제한
+        double y = _random.nextDouble() * (1080 - 400) + 200; // 세로 범위 제한
+        Offset candidate = Offset(x, y);
+
+        // 1. 현재 테이블 위 컵들과의 거리 체크
+        bool isFarFromCups = currentCups.every((cup) =>
+        (cup.position - candidate).distance > minDistance);
+
+        // 2. 다른 가이드 서클들과의 거리 체크
+        bool isFarFromGuides = _guidePositions.values.every((pos) =>
+        (pos - candidate).distance > minDistance);
+
+        if (isFarFromCups && isFarFromGuides) return candidate;
+        attempts++;
+      }
+      return const Offset(960, 540); // 실패 시 중앙 반환
+    }
+
+// [추가] 주문 대기열 상태와 가이드 좌표 싱크
+    void _updateGuidePositions() {
+      final pendingOrders = OrderManager.waitingQueue;
+      final currentOrderIds = pendingOrders.map((o) => o['orderNo']!).toSet();
+
+      // 1. 사라진 주문(매칭 완료된 주문)의 가이드 좌표 제거
+      _guidePositions.removeWhere((orderNo, _) => !currentOrderIds.contains(orderNo));
+
+      // 2. 새로 들어온 주문에 대해서만 새 좌표 할당
+      for (var order in pendingOrders) {
+        String no = order['orderNo']!;
+        if (!_guidePositions.containsKey(no)) {
+          _guidePositions[no] = _findSafePosition(objects);
+        }
+      }
     }
   }
   

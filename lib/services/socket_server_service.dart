@@ -1,12 +1,17 @@
 import 'dart:io';
 import 'dart:convert';
 import 'dart:async';
+import 'dart:ui';
 import '../config/app_constants.dart';
 import '../models/pickup_data.dart';
+import 'order_manager.dart';
 
 class SocketServerService {
   HttpServer? _server;
-  WebSocket? _socket;
+  final Map<String, List<WebSocket>> _roleClients = {
+    "KDS": [],
+    "TOF_SENSOR": [],
+  };
 
   final List<String> _allowedIps = [
     "192.168.10.191", // 라즈베리 파이
@@ -17,10 +22,12 @@ class SocketServerService {
   final Function(String) onLog;
   final Function(TofFrame) onDataReceived;
   final bool _useIpCheck = false;
+  final VoidCallback? onOrderReceived;
 
   SocketServerService({
     required this.onLog,
     required this.onDataReceived,
+    this.onOrderReceived,
   });
 
   // IP 접근 허용 여부 판단
@@ -73,7 +80,6 @@ class SocketServerService {
 
     // 허용된 IP 연결
     onLog("인증된 클라이언트 연결됨 ($clientIp)");
-    _socket = socket;
 
     socket.listen(
           (data) {
@@ -83,11 +89,27 @@ class SocketServerService {
           final Map<String, dynamic> jsonData = jsonDecode(rawString);
           final String type = jsonData['type'] ?? '';
 
-          // 1. [최우선 처리] KDS 주문 데이터인가?
+          if (type == 'identify') {
+            final String role = jsonData['role'] ?? 'UNKNOWN';
+            if (_roleClients.containsKey(role)) {
+              // 기존 리스트에 이미 이 소켓이 있다면 추가하지 않도록 방어 로직
+              if (!_roleClients[role]!.contains(socket)) {
+                _roleClients[role]!.add(socket);
+                onLog("✅ 기기 식별 완료: [Role: $role] [IP: $clientIp]");
+              }
+            }
+            return; // 식별 패킷은 여기서 처리 종료
+          }
+
+          // 2. KDS 주문 데이터 수신 (기존 유지)
           if (type == 'ORDER_READY') {
-            onLog("📢 KDS 주문 수신: ${jsonData['orderNo']}번 (${jsonData['menuName']})");
-            // TODO: 여기서 UI의 대기열 리스트에 추가하는 함수를 호출하세요.
-            return; // KDS 신호는 처리 끝났으니 여기서 종료
+            onLog("📢 KDS 주문 수신: ${jsonData['orderNo']}번");
+            OrderManager.addReadyOrder(
+                jsonData['orderNo'].toString(),
+                jsonData['menuName'] ?? "메뉴명 없음"
+            );
+            onOrderReceived?.call();
+            return;
           }
 
           // 2. [센서 데이터 처리] 기존 ToF 센서 로직
@@ -109,8 +131,8 @@ class SocketServerService {
         }
       },
       onDone: () {
-        onLog("연결 종료됨 ($clientIp)");
-        if (_socket == socket) _socket = null;
+        _roleClients.forEach((role, list) => list.remove(socket));
+        onLog("🔌 연결 종료됨 ($clientIp)");
       },
       onError: (error) {
         onLog("통신 에러 ($clientIp): $error");
@@ -118,18 +140,30 @@ class SocketServerService {
     );
   }
 
-  void sendMessage(String message) {
-    if (_socket != null && _socket!.readyState == WebSocket.open) {
-      _socket!.add(message);
+  void sendToRole(String role, String message) {
+    final targets = _roleClients[role];
+    if (targets != null && targets.isNotEmpty) {
+      for (var client in targets) {
+        if (client.readyState == WebSocket.open) {
+          client.add(message);
+        }
+      }
     } else {
-      onLog("전송 실패: 연결된 클라이언트가 없습니다.");
+      // 로그가 너무 많이 찍힐 수 있으니 필요할 때만 켭니다.
+      // onLog("전송 실패: 연결된 $role 클라이언트가 없습니다.");
     }
   }
 
   // 서버 종료
   void stopServer() {
     _server?.close();
-    _socket?.close();
+    // 모든 연결된 클라이언트 소켓 닫기
+    _roleClients.forEach((role, list) {
+      for (var s in list) {
+        s.close();
+      }
+      list.clear();
+    });
     onLog("서버 종료됨");
   }
 }
