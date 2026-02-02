@@ -1,5 +1,20 @@
-// lib/services/order_manager.dart
+import 'dart:ui';
+import 'dart:math' as math;
 import '../models/pickup_data.dart';
+
+class GhostOrder {
+  final String orderNo;
+  final String menuName;
+  final Offset lastPos;
+  final DateTime disappearedAt;
+
+  GhostOrder({
+    required this.orderNo,
+    required this.menuName,
+    required this.lastPos,
+    required this.disappearedAt,
+  });
+}
 
 class OrderManager {
   // 1. KDS에서 들어온 제조 완료 주문들 (대기열)
@@ -9,7 +24,14 @@ class OrderManager {
 
   // 2. 현재 테이블 위에 올라가 있는 컵(ToF ID)과 매칭된 주문 정보
   // Key: ToF ID (물리 ID), Value: { orderNo, menuName } (비즈니스 데이터)
-  static final Map<int, Map<String, String>> _activeMatches = {};
+  static final Map<int, Map<String, dynamic>> _activeMatches = {};
+
+  static final List<GhostOrder> _ghostMemory = [];
+
+  static List<GhostOrder> get ghostMemory => _ghostMemory;
+
+  static const double spatialThreshold = 250.0; // 25cm 이내면 동일 컵으로 간주
+  static const Duration ghostDuration = Duration(seconds: 2); // 2초간 기억
 
   // [KDS 연동] 소켓 서버에서 호출
   static void addReadyOrder(String no, String menu) {
@@ -17,46 +39,81 @@ class OrderManager {
     print("📦 [Manager] 대기열 추가: $no | 현재 대기: ${_waitingQueue.length}건");
   }
 
-  static Map<String, String>? getMatchedOrder(int tofId) {
-    if (_activeMatches.containsKey(tofId)) {
-      return _activeMatches[tofId];
-    }
-    return null; // 매칭된 게 없으면 그냥 null 반환 (새로 할당 안 함)
+  static Map<String, dynamic>? getMatchedOrder(int tofId) {
+    return _activeMatches[tofId];
   }
 
   // [ToF 연동] 새로운 컵이 감지되었을 때 호출 (기존 유지)
-  static Map<String, String>? getOrAssignOrder(int tofId, {String? forceOrderNo}) {
-    // 1. 이미 매칭된 ID라면 그대로 반환
+  static Map<String, dynamic>? getOrAssignOrder(int tofId, Offset currentPos) {
     if (_activeMatches.containsKey(tofId)) {
+      _activeMatches[tofId]!['pos'] = currentPos;
       return _activeMatches[tofId];
     }
 
-    // 2. 강제 할당 모드 (공간 추적 성공 시 사용)
-    if (forceOrderNo != null) {
-      final forcedOrder = {"orderNo": forceOrderNo, "menuName": "기존 주문 승계"};
-      _activeMatches[tofId] = forcedOrder;
-      print("📌 [Manager] ID $tofId 에 기존 번호 NO.$forceOrderNo 강제 승계 완료");
-      return forcedOrder;
+    _cleanupGhosts();
+    GhostOrder? matchedGhost;
+
+    for (var ghost in _ghostMemory) {
+      if ((ghost.lastPos - currentPos).distance < spatialThreshold) {
+        matchedGhost = ghost;
+        break;
+      }
     }
 
-    // 3. 일반 할당 모드 (신규 컵 등장 시)
+    if (matchedGhost != null) {
+      _ghostMemory.remove(matchedGhost);
+      final reclaimed = {
+        "orderNo": matchedGhost.orderNo,
+        "menuName": matchedGhost.menuName,
+        "pos": currentPos
+      };
+      _activeMatches[tofId] = reclaimed;
+      return reclaimed;
+    }
+
     if (_waitingQueue.isNotEmpty) {
-      final assignedOrder = _waitingQueue.removeAt(0);
-      _activeMatches[tofId] = assignedOrder;
-      print("🎯 [Manager] ID $tofId <-> 주문 ${assignedOrder['orderNo']} 신규 할당");
-      return assignedOrder;
+      final assigned = _waitingQueue.removeAt(0);
+      final newMatch = {
+        "orderNo": assigned['orderNo']!,
+        "menuName": assigned['menuName']!,
+        "pos": currentPos
+      };
+      _activeMatches[tofId] = newMatch;
+      return newMatch;
     }
-
     return null;
   }
 
-  // releaseId가 삭제된 주문 정보를 반환하도록 수정
-  static Map<String, String>? releaseId(int tofId) {
+  static Map<String, dynamic>? releaseId(int tofId) {
     if (_activeMatches.containsKey(tofId)) {
-      final removedOrder = _activeMatches.remove(tofId);
-      print("🗑️ [Manager] ID $tofId (주문 ${removedOrder?['orderNo']}) 매칭 해제 및 반환");
-      return removedOrder;
+      final removed = _activeMatches.remove(tofId);
+
+      // [수정] 주문번호가 UNKNOWN이 아닐 때만 유령으로 등록
+      if (removed!['orderNo'] != "UNKNOWN") {
+        _ghostMemory.add(GhostOrder(
+          orderNo: removed['orderNo'],
+          menuName: removed['menuName'],
+          lastPos: removed['pos'],
+          disappearedAt: DateTime.now(),
+        ));
+        print("⏳ [Manager] No.${removed['orderNo']} 유령 전환");
+      } else {
+        print("🗑️ [Manager] UNKNOWN 객체 삭제 (유령 등록 안 함)");
+      }
+      return removed;
     }
     return null;
+  }
+
+  static void _cleanupGhosts() {
+    final now = DateTime.now();
+    _ghostMemory.removeWhere((g) => now.difference(g.disappearedAt) > ghostDuration);
+  }
+
+  static bool isGhostStillExists(String orderNo, Offset pos) {
+    _cleanupGhosts();
+    return _ghostMemory.any((g) =>
+    g.orderNo == orderNo && (g.lastPos - pos).distance < 10.0
+    );
   }
 }
