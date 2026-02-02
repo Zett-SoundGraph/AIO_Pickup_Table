@@ -67,7 +67,7 @@ class SocketServerService {
   }
 
   DateTime _lastProcessTime = DateTime.now();
-  final int _minIntervalMs = 33;
+  final int _minIntervalMs = 66;
 
   // 연결 처리
   void _handleConnection(WebSocket socket, HttpRequest request) {
@@ -173,14 +173,21 @@ class SocketServerService {
 
   // 서버 종료
   void stopServer() {
+    // 1. 서버 소켓 닫기
     _server?.close();
-    // 모든 연결된 클라이언트 소켓 닫기
-    _roleClients.forEach((role, list) {
-      for (var s in list) {
-        s.close();
+
+    // 2. 모든 활성 소켓 강제 종료
+    for (var client in _allClients) {
+      try {
+        client.close();
+      } catch (e) {
+        debugPrint("Socket close error: $e");
       }
-      list.clear();
-    });
-    onLog("서버 종료됨");
+    }
+
+    // 3. 리스트 비우기
+    _allClients.clear();
+    _roleClients.forEach((role, list) => list.clear());
+    onLog("서버 및 모든 연결 종료됨");
   }
 }

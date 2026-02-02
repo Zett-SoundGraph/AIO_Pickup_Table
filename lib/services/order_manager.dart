@@ -28,13 +28,22 @@ class OrderManager {
 
   static final List<GhostOrder> _ghostMemory = [];
 
-  static List<GhostOrder> get ghostMemory => _ghostMemory;
+  static List<GhostOrder> get ghostMemory {
+    _cleanupGhosts();
+    // 원본 리스트를 그대로 주지 않고 복사해서 주어 UI 렌더링 중 데이터 오염을 방지함
+    return List.unmodifiable(_ghostMemory);
+  }
 
   static const double spatialThreshold = 250.0; // 25cm 이내면 동일 컵으로 간주
-  static const Duration ghostDuration = Duration(seconds: 2); // 2초간 기억
+  static const Duration ghostDuration = Duration(seconds: 5); // 2초간 기억
 
   // [KDS 연동] 소켓 서버에서 호출
+  static const int maxQueueSize = 50;
+
   static void addReadyOrder(String no, String menu) {
+    if (_waitingQueue.length >= maxQueueSize) {
+      _waitingQueue.removeAt(0); // 너무 오래된 주문은 밀어냄
+    }
     _waitingQueue.add({"orderNo": no, "menuName": menu});
     print("📦 [Manager] 대기열 추가: $no | 현재 대기: ${_waitingQueue.length}건");
   }
@@ -45,12 +54,12 @@ class OrderManager {
 
   // [ToF 연동] 새로운 컵이 감지되었을 때 호출 (기존 유지)
   static Map<String, dynamic>? getOrAssignOrder(int tofId, Offset currentPos) {
+    _cleanupGhosts();
     if (_activeMatches.containsKey(tofId)) {
       _activeMatches[tofId]!['pos'] = currentPos;
       return _activeMatches[tofId];
     }
 
-    _cleanupGhosts();
     GhostOrder? matchedGhost;
 
     for (var ghost in _ghostMemory) {
@@ -113,7 +122,7 @@ class OrderManager {
   static bool isGhostStillExists(String orderNo, Offset pos) {
     _cleanupGhosts();
     return _ghostMemory.any((g) =>
-    g.orderNo == orderNo && (g.lastPos - pos).distance < 10.0
+    g.orderNo == orderNo && (g.lastPos - pos).distance < 30.0
     );
   }
 }
