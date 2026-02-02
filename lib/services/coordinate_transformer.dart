@@ -1,4 +1,7 @@
+import 'dart:convert';
 import 'dart:ui';
+import 'package:flutter/material.dart';
+
 import '../config/app_constants.dart';
 
 class CoordinateTransformer {
@@ -10,6 +13,10 @@ class CoordinateTransformer {
     _h = matrix;
     print("🎯 CoordinateTransformer: 새로운 호모그래피 행렬이 적용되었습니다.");
   }
+  static void resetMatrix() {
+    _h = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+    debugPrint("🔄 [Transformer] 행렬이 초기화되었습니다. (Collapse 현상 방지)");
+  }
 
   static Offset getParallaxCorrectedOffset(double rawX, double rawY, double zValue) {
     double parallaxRatio = zValue / AppConstants.totalSensorHeight;
@@ -18,10 +25,21 @@ class CoordinateTransformer {
     return Offset(px, py);
   }
 
+  static bool _isFirstHeightSet = false;
   static void updateFloorHeight(double rawZ) {
-    if (rawZ > 1000) {
+    // 1. 센서가 측정한 광학적 바닥 높이(예: 1016)를 그대로 신뢰합니다.
+    double currentHeight = AppConstants.totalSensorHeight;
+    double diff = (rawZ - currentHeight).abs();
+
+    // 2. [최적화] 첫 실행이거나, 변화량이 5mm 이상일 때만 업데이트
+    if (!_isFirstHeightSet || diff >= 5.0) {
       AppConstants.totalSensorHeight = rawZ;
-      print("바닥 높이 갱신 완료: ${AppConstants.totalSensorHeight}mm");
+      _isFirstHeightSet = true;
+
+      debugPrint("📢 [Sensor Sync] 바닥 높이(base_z) 확정: ${rawZ.toStringAsFixed(1)}mm");
+      if (diff >= 5.0 && _isFirstHeightSet) {
+        debugPrint("⚠️ 환경 변화 감지 (차이: ${diff.toStringAsFixed(1)}mm)");
+      }
     }
   }
 

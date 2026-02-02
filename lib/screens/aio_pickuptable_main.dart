@@ -244,6 +244,12 @@ import 'calibration_screen.dart';
         // 1. 호모그래피 행렬 계산 (한 번만 수행)
         final Matrix hMatrix = HomographySolver.solve(srcPoints, dstPoints);
 
+        String matrixLog = "";
+        for(int i=0; i<3; i++) {
+          matrixLog += "[${hMatrix[i][0].toStringAsFixed(4)}, ${hMatrix[i][1].toStringAsFixed(4)}, ${hMatrix[i][2].toStringAsFixed(4)}] ";
+        }
+        debugPrint("📊 생성된 행렬: $matrixLog");
+
         // 2. 행렬 값 리스트화 및 적용
         List<double> matrixValues = [
           hMatrix[0][0], hMatrix[0][1], hMatrix[0][2],
@@ -260,11 +266,11 @@ import 'calibration_screen.dart';
         // 4. ROI 역산 및 라즈베리파이 전송
         final Matrix invH = hMatrix.inverse(); // 역행렬 계산
         final List<Map<String, dynamic>> roiConfigs = [
-          {"id": 1, "name": "Top-Left", "pos": const Offset(0, 0)},
-          {"id": 2, "name": "Top-Right", "pos": const Offset(1920, 0)},
-          {"id": 3, "name": "Bottom-Left", "pos": const Offset(0, 1080)},
-          {"id": 4, "name": "Bottom-Right", "pos": const Offset(1920, 1080)},
-          {"id": 5, "name": "Center", "pos": const Offset(960, 540)},
+          {"id": 1, "name": "Top-Left", "pos": const Offset(100, 100)},
+          {"id": 2, "name": "Top-Right", "pos": const Offset(1770, 100)},
+          {"id": 3, "name": "Bottom-Left", "pos": const Offset(100, 1030)},
+          {"id": 4, "name": "Bottom-Right", "pos": const Offset(1770, 1030)},
+          {"id": 5, "name": "Center", "pos": const Offset(935, 565)},
         ];
 
         List<Map<String, dynamic>> roiPoints = [];
@@ -291,11 +297,21 @@ import 'calibration_screen.dart';
           });
         }
 
-        _serverService.sendToRole("TOF_SENSOR", jsonEncode({
+        _serverService.sendMessage(jsonEncode({
           "event_type": "set_roi",
           "timestamp": DateTime.now().toIso8601String(),
           "roi_points": roiPoints,
         }));
+        // _serverService.sendMessage(jsonEncode({
+        //   "event_type": "set_roi",
+        //   "timestamp": DateTime.now().toIso8601String(),
+        //   "roi_points": roiPoints.map((p) => {
+        //     "id": p['id'],
+        //     // ★ 소수점 4자리까지만 반올림하여 전송 (데이터 가독성 및 안정성 향상)
+        //     "x": double.parse(p['x'].toStringAsFixed(4)),
+        //     "y": double.parse(p['y'].toStringAsFixed(4)),
+        //   }).toList(),
+        // }));
         _addLog("SYS", "📤 ROI Packet Sent to Raspberry Pi");
 
       } catch (e) {
@@ -310,40 +326,61 @@ import 'calibration_screen.dart';
           },
           onDataReceived: (TofFrame frame) {
             // 1. 바닥 높이 동기화 이벤트 처리
-            if (frame.eventType == "base_z" && frame.baseZ != null) {
+            if (frame.baseZ != null) {
               CoordinateTransformer.updateFloorHeight(frame.baseZ!);
-              _addLog("SYS", "🎯 기준 바닥 높이 동기화: ${frame.baseZ}mm");
-              return;
             }
 
-            // ================= [로그 콘솔 출력 로직 복구] =================
+            // [복구 1] 캘리브레이션 화면용 실시간 원시 좌표 전송
+            setState(() {
+              if (frame.objects.isNotEmpty) {
+                var obj = frame.objects.first;
+                // 시차 보정(Parallax)을 거친 좌표를 CalibrationScreen에 전달 (캡쳐 가능해짐)
+                _latestRawForCalib = CoordinateTransformer.getParallaxCorrectedOffset(obj.x, obj.y, obj.z);
+              } else {
+                _latestRawForCalib = null;
+              }
+            });
+
+            // [복구 2] 화면 로그 콘솔 출력 (이전과 동일하게 유지)
             bool isChanged = _hasSignificantChange(frame.objects, _lastFrameObjects);
-            bool shouldLog = _showRawData || isChanged;
-
-            if (shouldLog) {
+            if (_showRawData || isChanged) {
               String tag = (!_showRawData && isChanged) ? "MOVE" : "RX";
-              _addLog(tag, "=== Frame: ${frame.frameId} (Count: ${frame.objects.length}) ===", frameId: frame.frameId);
-
+              _addLog(tag, "=== Frame: ${frame.frameId} (Count: ${frame.objects.length}, BaseZ: ${frame.baseZ?.toStringAsFixed(1)}) ===", frameId: frame.frameId);
               for (var obj in frame.objects) {
-                double radius = obj.diameter / 2;
                 _addLog(
-                  tag,
-                  "  > [ID:${obj.id}] x:${obj.x.toStringAsFixed(0)}, y:${obj.y.toStringAsFixed(0)}, z:${obj.z.toStringAsFixed(0)}, w:${obj.width.toStringAsFixed(0)}, h:${obj.height.toStringAsFixed(0)}, r:${radius.toStringAsFixed(1)}",
-                  frameId: frame.frameId,
-                  objectId: obj.id,
+                    tag,
+                    "  > [ID:${obj.id}] "
+                        "x:${obj.x.toStringAsFixed(0)}, "
+                        "y:${obj.y.toStringAsFixed(0)}, "
+                        "z:${obj.z.toStringAsFixed(0)}, "
+                        "w:${obj.width.toStringAsFixed(0)}, "
+                        "h:${obj.height.toStringAsFixed(0)}, "
+                        "r:${(obj.diameter / 2).toStringAsFixed(1)}",
+                    frameId: frame.frameId,
+                    objectId: obj.id
                 );
               }
             }
             _lastFrameObjects = frame.objects;
-            _currentLatestFrameId = frame.frameId; // 최신 프레임 ID 업데이트 (로그 색상용)
-            // ==========================================================
+            _currentLatestFrameId = frame.frameId;
 
             setState(() {
-              // 2. 센서 데이터 UI 좌표 변환
-              List<Map<String, dynamic>> sensorInputs = frame.objects.map((tof) => {
-                'id': tof.id,
-                'pos': CoordinateTransformer.transform(tof.x, tof.y, tof.z),
-                'raw': tof
+              // 2. 센서 데이터 UI 좌표 변환 및 [CALIB] 로그 복구
+              List<Map<String, dynamic>> sensorInputs = frame.objects.map((tof) {
+                Offset calibratedPos = CoordinateTransformer.transform(tof.x, tof.y, tof.z);
+
+                // [복구 3] 터미널 출력용 변환 로그 (Raw -> UI 확인용)
+                debugPrint(
+                    "[CALIB] ID:${tof.id} | "
+                        "Raw(${tof.x.toStringAsFixed(1)}, ${tof.y.toStringAsFixed(1)}) "
+                        "-> UI(${calibratedPos.dx.toStringAsFixed(1)}, ${calibratedPos.dy.toStringAsFixed(1)})"
+                );
+
+                return {
+                  'id': tof.id,
+                  'pos': calibratedPos,
+                  'raw': tof
+                };
               }).toList();
 
               List<DetectedObject> nextObjects = [];
@@ -351,7 +388,7 @@ import 'calibration_screen.dart';
               // 3. 기존 컵 유지 및 근접 매칭 (Spatial Proximity)
               for (var existing in objects) {
                 int closestIndex = -1;
-                double minDistance = 50.0; // 50px 이내로 판정 (필요시 조정)
+                double minDistance = 50.0;
 
                 for (int i = 0; i < sensorInputs.length; i++) {
                   double dist = (existing.position - (sensorInputs[i]['pos'] as Offset)).distance;
@@ -365,11 +402,7 @@ import 'calibration_screen.dart';
                   var matched = sensorInputs.removeAt(closestIndex);
                   var tof = matched['raw'] as TofObject;
 
-                  // ID가 바뀌었어도 기존 주문 번호 강제 승계
-                  if (existing.id != matched['id']) {
-                    OrderManager.releaseId(existing.id);
-                    OrderManager.getOrAssignOrder(matched['id'], forceOrderNo: existing.orderNo);
-                  }
+                  OrderManager.getOrAssignOrder(matched['id'], matched['pos']);
 
                   nextObjects.add(DetectedObject(
                     id: matched['id'],
@@ -381,27 +414,37 @@ import 'calibration_screen.dart';
                     uiHeight: CoordinateTransformer.getUiSize(tof.width, tof.height).height,
                   ));
                 } else {
-                  // 픽업 완료 처리
+                  // 픽업 완료 처리 및 KDS 전송
                   final removedOrder = OrderManager.releaseId(existing.id);
-                  if (removedOrder != null && removedOrder['orderNo'] != "WAIT") {
-                    _serverService.sendToRole("KDS", jsonEncode({
-                      "type": "PICKUP_COMPLETE",
-                      "orderNo": removedOrder['orderNo'],
-                    }));
-                    _addLog("SYS", "📤 [PICKUP] No.${removedOrder['orderNo']} 완료 전송");
+                  if (removedOrder != null && removedOrder['orderNo'] != "UNKNOWN") {
+                    Timer(OrderManager.ghostDuration, () {
+                      // String 형변환 명시
+                      String oNo = removedOrder['orderNo'].toString();
+                      String mName = removedOrder['menuName'].toString();
+
+                      if (OrderManager.isGhostStillExists(oNo, existing.position)) {
+                        _serverService.sendToRole("KDS", jsonEncode({
+                          "type": "PICKUP_COMPLETE",
+                          "orderNo": oNo,
+                          "menuName": mName,
+                        }));
+                      }
+                    });
                   }
                   exitingObjects.add(existing);
                 }
               }
 
-              // 4. 신규 컵 추가
+              // 4. 신규 컵 추가 (UNKNOWN 상태)
               for (var nuevo in sensorInputs) {
                 var tof = nuevo['raw'] as TofObject;
-                final orderInfo = OrderManager.getOrAssignOrder(tof.id);
+                Offset pos = nuevo['pos'];
 
+                // [수정 포인트 2] OrderManager에게 좌표를 전달하여 유령 부활 여부 확인
+                final orderInfo = OrderManager.getOrAssignOrder(tof.id, pos);
                 nextObjects.add(DetectedObject(
                   id: tof.id,
-                  orderNo: orderInfo?['orderNo'] ?? "WAIT",
+                  orderNo: orderInfo?['orderNo'] ?? "UNKNOWN",
                   position: nuevo['pos'],
                   zValue: tof.z,
                   diameter: CoordinateTransformer.getUiDiameter(tof.diameter),
@@ -411,7 +454,7 @@ import 'calibration_screen.dart';
               }
 
               objects = nextObjects;
-              _updateGuidePositions(); // 가이드 원 위치 갱신
+              _updateGuidePositions(); // 가이드 서클 위치 동기화
             });
           }
       );
@@ -1045,7 +1088,13 @@ import 'calibration_screen.dart';
                     child: FloatingActionButton.small(
                       heroTag: "calibBtn",
                       backgroundColor: Colors.orangeAccent,
-                      onPressed: () => setState(() => _isCalibrating = true),
+                      onPressed: () {
+                        setState(() {
+                          CoordinateTransformer.resetMatrix();
+                          _serverService.sendMessage(jsonEncode({"event_type": "rpi_reboot"}));
+                          _isCalibrating = true;
+                        });
+                      },
                       child: const Icon(Icons.ads_click, color: Colors.black),
                     ),
                   ),
@@ -1067,6 +1116,27 @@ import 'calibration_screen.dart';
                         _processCalibration(data);
                       },
                     ),
+                  ...OrderManager.ghostMemory.map((ghost) {
+                    return Positioned(
+                      left: ghost.lastPos.dx - 45,
+                      top: ghost.lastPos.dy - 45,
+                      child: Opacity(
+                        opacity: 0.2,
+                        child: Container(
+                          width: 90, height: 90,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            // BorderStyle.dashed 에러 수정: solid로 변경
+                            border: Border.all(color: Colors.white, width: 2, style: BorderStyle.solid),
+                          ),
+                          child: Center(
+                            child: Text(ghost.orderNo,
+                                style: const TextStyle(color: Colors.white, fontSize: 10)),
+                          ),
+                        ),
+                      ),
+                    );
+                  }).toList(),
                 ],
               );
             }
@@ -1565,6 +1635,10 @@ import 'calibration_screen.dart';
 
       final double safeAngle = _calculateSafeAngle();
 
+      final String displayText = object.orderNo == "UNKNOWN"
+          ? "UNKNOWN"
+          : "NO.${object.orderNo}";
+
       return SizedBox(
         width: finalSize,
         height: finalSize,
@@ -1596,7 +1670,7 @@ import 'calibration_screen.dart';
                 return CustomPaint(
                   size: Size(finalSize, finalSize),
                   painter: ArcTextPainter(
-                    text: "NO.${object.orderNo}",
+                    text: displayText,
                     radius: textRadius,
                     startAngle: animatedAngle,
                     style: TextStyle(

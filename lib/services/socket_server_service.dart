@@ -2,12 +2,15 @@ import 'dart:io';
 import 'dart:convert';
 import 'dart:async';
 import 'dart:ui';
+import 'package:flutter/material.dart';
+
 import '../config/app_constants.dart';
 import '../models/pickup_data.dart';
 import 'order_manager.dart';
 
 class SocketServerService {
   HttpServer? _server;
+  final List<WebSocket> _allClients = [];
   final Map<String, List<WebSocket>> _roleClients = {
     "KDS": [],
     "TOF_SENSOR": [],
@@ -77,9 +80,10 @@ class SocketServerService {
       socket.close(WebSocketStatus.policyViolation, "허용되지 않은 IP");
       return; // 함수 종료
     }
-
+    _allClients.add(socket);
     // 허용된 IP 연결
     onLog("인증된 클라이언트 연결됨 ($clientIp)");
+    debugPrint("인증된 클라이언트 연결됨 ($clientIp)");
 
     socket.listen(
           (data) {
@@ -131,6 +135,7 @@ class SocketServerService {
         }
       },
       onDone: () {
+        _allClients.remove(socket);
         _roleClients.forEach((role, list) => list.remove(socket));
         onLog("🔌 연결 종료됨 ($clientIp)");
       },
@@ -139,7 +144,19 @@ class SocketServerService {
       },
     );
   }
+  void sendMessage(String message) {
+    if (_allClients.isEmpty) {
+      // onLog("⚠️ 전송 실패: 연결된 클라이언트가 없습니다.");
+      return;
+    }
 
+    for (var client in _allClients) {
+      if (client.readyState == WebSocket.open) {
+        client.add(message);
+      }
+    }
+    // onLog("📡 모든 클라이언트에게 데이터 전송 완료 (${_allClients.length}대)");
+  }
   void sendToRole(String role, String message) {
     final targets = _roleClients[role];
     if (targets != null && targets.isNotEmpty) {
