@@ -22,7 +22,7 @@ class TofObject {
   factory TofObject.fromJson(Map<String, dynamic> json) {
     // 안전한 파싱을 위해 null 체크 및 타입 변환 적용
     return TofObject(
-      id: json['object_id'] as int? ?? -1,
+      id: json['object_id'] as int? ?? json['hand_id'] as int? ?? -1,
       x: (json['position']?['x'] as num?)?.toDouble() ?? 0.0,
       y: (json['position']?['y'] as num?)?.toDouble() ?? 0.0,
       z: (json['z_value'] as num?)?.toDouble() ?? 0.0,
