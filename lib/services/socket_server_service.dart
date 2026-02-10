@@ -22,7 +22,7 @@ class SocketServerService {
   ];
 
   // UI로 데이터와 로그를 전달해줄 콜백 함수들
-  final Function(String) onLog;
+  final Function(String, {bool force}) onLog;
   final Function(TofFrame) onDataReceived;
   final bool _useIpCheck = false;
   final VoidCallback? onOrderReceived;
@@ -47,9 +47,9 @@ class SocketServerService {
       onLog("서버 시작됨 (IP: ${_server?.address.address} : ${AppConstants.serverPort})");
 
       if (_useIpCheck) {
-        onLog("보안 모드: ON (허용된 IP만 접속 가능)");
+        onLog("보안 모드: ON (허용된 IP만 접속 가능)", force: true);
       } else {
-        onLog("보안 모드: OFF (모든 IP 접속 가능)");
+        onLog("보안 모드: OFF (모든 IP 접속 가능)", force: true);
       }
 
       await for (HttpRequest request in _server!) {
@@ -76,13 +76,13 @@ class SocketServerService {
 
     // IP 연결 허용 체크
     if (!_isConnectionAllowed(clientIp)) {
-      onLog("차단됨: 허용되지 않은 IP ($clientIp)");
+      onLog("차단됨: 허용되지 않은 IP ($clientIp)", force: true);
       socket.close(WebSocketStatus.policyViolation, "허용되지 않은 IP");
       return; // 함수 종료
     }
     _allClients.add(socket);
     // 허용된 IP 연결
-    onLog("인증된 클라이언트 연결됨 ($clientIp)");
+    onLog("인증된 클라이언트 연결됨 ($clientIp)", force: true);
     debugPrint("인증된 클라이언트 연결됨 ($clientIp)");
 
     socket.listen(
@@ -99,7 +99,7 @@ class SocketServerService {
               // 기존 리스트에 이미 이 소켓이 있다면 추가하지 않도록 방어 로직
               if (!_roleClients[role]!.contains(socket)) {
                 _roleClients[role]!.add(socket);
-                onLog("✅ 기기 식별 완료: [Role: $role] [IP: $clientIp]");
+                onLog("✅ 기기 식별 완료: [Role: $role] [IP: $clientIp]", force: true);
               }
             }
             return; // 식별 패킷은 여기서 처리 종료
@@ -131,22 +131,22 @@ class SocketServerService {
           onDataReceived(tofFrame);
 
         } catch (e) {
-          onLog("데이터 해석 에러 ($clientIp): $e");
+          onLog("데이터 해석 에러 ($clientIp): $e", force: true);
         }
       },
       onDone: () {
         _allClients.remove(socket);
         _roleClients.forEach((role, list) => list.remove(socket));
-        onLog("🔌 연결 종료됨 ($clientIp)");
+        onLog("🔌 연결 종료됨 ($clientIp)", force: true);
       },
       onError: (error) {
-        onLog("통신 에러 ($clientIp): $error");
+        onLog("통신 에러 ($clientIp): $error", force: true);
       },
     );
   }
   void sendMessage(String message) {
     if (_allClients.isEmpty) {
-      // onLog("⚠️ 전송 실패: 연결된 클라이언트가 없습니다.");
+      onLog("⚠️ 전송 실패: 연결된 클라이언트가 없습니다.");
       return;
     }
 
@@ -155,7 +155,7 @@ class SocketServerService {
         client.add(message);
       }
     }
-    // onLog("📡 모든 클라이언트에게 데이터 전송 완료 (${_allClients.length}대)");
+    onLog("📡 모든 클라이언트에게 데이터 전송 완료 (${_allClients.length}대)");
   }
   void sendToRole(String role, String message) {
     final targets = _roleClients[role];
@@ -167,7 +167,7 @@ class SocketServerService {
       }
     } else {
       // 로그가 너무 많이 찍힐 수 있으니 필요할 때만 켭니다.
-      // onLog("전송 실패: 연결된 $role 클라이언트가 없습니다.");
+      onLog("전송 실패: 연결된 $role 클라이언트가 없습니다.");
     }
   }
 
@@ -188,6 +188,6 @@ class SocketServerService {
     // 3. 리스트 비우기
     _allClients.clear();
     _roleClients.forEach((role, list) => list.clear());
-    onLog("서버 및 모든 연결 종료됨");
+    onLog("서버 및 모든 연결 종료됨", force: true);
   }
 }
