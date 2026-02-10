@@ -19,9 +19,18 @@ class CoordinateTransformer {
   }
 
   static Offset getParallaxCorrectedOffset(double rawX, double rawY, double zValue) {
-    double parallaxRatio = zValue / AppConstants.totalSensorHeight;
-    double px = (rawX - AppConstants.sensorCenterX) * parallaxRatio + AppConstants.sensorCenterX;
-    double py = (rawY - AppConstants.sensorCenterY) * parallaxRatio + AppConstants.sensorCenterY;
+    // 1. 기본 비율 계산
+    double ratio = zValue / AppConstants.totalSensorHeight;
+
+    // 2. [정밀 튜닝] 축별 보정 강도(Gain) 적용
+    // X는 너무 좁아지므로 1.0보다 크게(덜 좁히기), Y는 너무 벌어지므로 1.0보다 작게(더 당기기)
+    const double gainX = 1.015; // 가로 수축 방지 (1.5% 확장)
+    const double gainY = 0.980; // 세로 과확장 방지 (2.0% 축소)
+
+    // 3. 중심점(320, 240) 기준 보정 수행
+    double px = (rawX - AppConstants.sensorCenterX) * (ratio * gainX) + AppConstants.sensorCenterX;
+    double py = (rawY - AppConstants.sensorCenterY) * (ratio * gainY) + AppConstants.sensorCenterY;
+
     return Offset(px, py);
   }
 

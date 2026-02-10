@@ -68,6 +68,7 @@ class SocketServerService {
 
   DateTime _lastProcessTime = DateTime.now();
   final int _minIntervalMs = 66;
+  int _lastObjectCount = 0;
 
   // 연결 처리
   void _handleConnection(WebSocket socket, HttpRequest request) {
@@ -117,16 +118,28 @@ class SocketServerService {
           }
 
           // 2. [센서 데이터 처리] 기존 ToF 센서 로직
-          final now = DateTime.now();
-          bool isCritical = rawString.contains("object_appeared") || rawString.contains("object_removed");
-          bool isTimeOk = now.difference(_lastProcessTime).inMilliseconds >= _minIntervalMs;
+          // final now = DateTime.now();
+          // bool isCritical = rawString.contains("object_appeared") || rawString.contains("object_removed");
+          // bool isTimeOk = now.difference(_lastProcessTime).inMilliseconds >= _minIntervalMs;
+          //
+          // // 중요 이벤트가 아니고 시간도 안 됐으면 무시
+          // if (!isCritical && !isTimeOk) return;
 
-          // 중요 이벤트가 아니고 시간도 안 됐으면 무시
-          if (!isCritical && !isTimeOk) return;
-
-          _lastProcessTime = now;
+          //_lastProcessTime = now;
 
           // ToF 데이터 파싱 및 전송
+//           final tofFrame = TofFrame.fromJson(jsonData);
+//           bool isCountChanged = tofFrame.objects.length != _lastObjectCount;
+//           _lastObjectCount = tofFrame.objects.length;
+//
+//           final now = DateTime.now();
+//           bool isTimeOk = now.difference(_lastProcessTime).inMilliseconds >= _minIntervalMs;
+//
+// // 개수가 변했거나, 시간이 됐을 때만 UI 업데이트 실행
+//           if (isCountChanged || isTimeOk) {
+//             _lastProcessTime = now;
+//             onDataReceived(tofFrame);
+//           }
           final tofFrame = TofFrame.fromJson(jsonData);
           onDataReceived(tofFrame);
 
