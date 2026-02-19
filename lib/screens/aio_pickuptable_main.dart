@@ -13,6 +13,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../components/animation_kit.dart';
 import '../components/arc_text_painter.dart';
+import '../components/hand_detection_overlay.dart';
 import '../services/coordinate_transformer.dart';
 import '../services/homography_solver.dart';
 import '../services/order_manager.dart';
@@ -87,6 +88,24 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
   String _currentTimeStr = "00:00:00";
   Timer? _clockTimer;
 
+  bool _isHandDetected = false;
+  Timer? _handDetectionTimer;
+
+  void _resetHandDetectionTimer() {
+    // 기존 타이머가 있다면 취소
+    _handDetectionTimer?.cancel();
+
+    _handDetectionTimer = Timer(const Duration(milliseconds: 800), () {
+      if (mounted && _isHandDetected) {
+        setState(() {
+          _isHandDetected = false;
+          hands = []; // 손 데이터도 초기화
+        });
+        _addLog("SYS", "👋 손 감지 시간 초과: 효과 해제", force: true);
+      }
+    });
+  }
+
   final List<Color> _idPalette = List.generate(100, (index) {
     double hue = (index * 137.508) % 360;
 
@@ -98,8 +117,6 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
   });
 
   final ValueNotifier<List<Offset>> _obstacleNotifier = ValueNotifier([]);
-
-// _initializeServer의 onDataReceived 마지막 부분 수정
 
   int? _currentLatestFrameId;
 
@@ -115,8 +132,6 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
     _loadSavedMatrix();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     _initializeServer();
-
-    // 테스트용 WebSocket Server IP, Port
     _logCurrentServerIp();
     _startClock();
   }
@@ -325,6 +340,15 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
         onOrderReceived: () {
           if (mounted) setState(() => _updateGuidePositions());
         },
+        onCalibrationRequested: () {
+          if (!mounted) return;
+          setState(() {
+            CoordinateTransformer.resetMatrix();
+            // 센서(RPi)에게도 캘리브레이션 모드임을 알림
+            _serverService.sendMessage(jsonEncode({"event_type": "cal_restart"}));
+            _isCalibrating = true;
+          });
+        },
         onDataReceived: (TofFrame frame) {
           if (frame.baseZ != null) {
             CoordinateTransformer.updateFloorHeight(frame.baseZ!);
@@ -335,7 +359,15 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
           //   return;
           // }
           // _lastUiUpdateTime = now;
+          if (frame.objects.isNotEmpty) {
+            var obj = frame.objects.first;
+            setState(() {
+              _latestRawForCalib = CoordinateTransformer.getParallaxCorrectedOffset(obj.x, obj.y, obj.z);
+            });
+          }
 
+          // [핵심 수정] 하지만 컵/손 관리 로직(UI 위젯 생성)은 캘리브레이션 중에는 중단
+          if (_isCalibrating) return;
           if (frame.eventType == 'object_tracking') {
             _processHandTracking(frame); // 손(Hand) 전용
           } else {
@@ -366,6 +398,11 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
     }
 
     setState(() {
+      _resetHandDetectionTimer();
+
+      if (!_isHandDetected) {
+        setState(() => _isHandDetected = true);
+      }
       _currentLatestFrameId = frame.frameId; // 현재 프레임 ID 업데이트 (로그 색상 강조용)
 
       // 손 데이터 변환 및 저장
@@ -390,6 +427,10 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
 
     // 단일 setState로 통합 (초당 렌더링 부하 감소)
     setState(() {
+      _handDetectionTimer?.cancel();
+      if (_isHandDetected) {
+        setState(() => _isHandDetected = false);
+      }
       // [로그 1] 캘리브레이션용 좌표 (전체 데이터 기준)
       if (frame.objects.isNotEmpty) {
         var obj = frame.objects.first;
@@ -466,6 +507,11 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
             uiHeight: CoordinateTransformer.getUiSize(tof.width, tof.height).height,
           ));
         } else {
+          final Offset pickupPosition = existing.position;
+          final List<Offset> currentCupPositions = sensorInputs.map((e) => e['pos'] as Offset).toList();
+
+          // 2. GlobalKey를 통해 FloatingVideoLayer의 이동 함수 호출
+          _videoLayerKey.currentState?.moveVideoToPosition(pickupPosition, currentCupPositions);
           // 픽업 완료 처리
           final removedOrder = OrderManager.releaseId(existing.id);
           if (removedOrder != null && removedOrder['orderNo'] != "UNKNOWN") {
@@ -583,12 +629,14 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
 
   @override
   void dispose() {
+    _handDetectionTimer?.cancel();
     _serverService.stopServer();
     _clockTimer?.cancel();
     _adTimer?.cancel();
     _scrollController.dispose();
-    _pickupTimers.values.forEach((t) => t.cancel());
+    _pickupTimers.forEach((key, timer) => timer.cancel());
     _pickupTimers.clear();
+    _obstacleNotifier.dispose();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     super.dispose();
   }
@@ -709,6 +757,9 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
                     ),
                   );
                 }), // .ma
+                IgnorePointer( // 터치 이벤트를 방해하지 않도록 설정
+                  child: HandDetectionOverlay(visible: _isHandDetected),
+                ),
 
                 // (디버깅용) 우측 상단 포트 정보
                 Positioned(
@@ -859,21 +910,21 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
                     ),
                   ),
 
-                Positioned(
-                  bottom: 20, right: 80,
-                  child: FloatingActionButton.small(
-                    heroTag: "calibBtn",
-                    backgroundColor: Colors.orangeAccent,
-                    onPressed: () {
-                      setState(() {
-                        CoordinateTransformer.resetMatrix();
-                        _serverService.sendMessage(jsonEncode({"event_type": "cal_restart"}));
-                        _isCalibrating = true;
-                      });
-                    },
-                    child: const Icon(Icons.ads_click, color: Colors.black),
-                  ),
-                ),
+                // Positioned(
+                //   bottom: 20, right: 80,
+                //   child: FloatingActionButton.small(
+                //     heroTag: "calibBtn",
+                //     backgroundColor: Colors.orangeAccent,
+                //     onPressed: () {
+                //       setState(() {
+                //         CoordinateTransformer.resetMatrix();
+                //         _serverService.sendMessage(jsonEncode({"event_type": "cal_restart"}));
+                //         _isCalibrating = true;
+                //       });
+                //     },
+                //     child: const Icon(Icons.ads_click, color: Colors.black),
+                //   ),
+                // ),
                 // 콘솔 토글 버튼 (우측 하단)
                 Positioned(
                   bottom: 20, right: 20,
@@ -892,27 +943,27 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
                       _processCalibration(data);
                     },
                   ),
-                ...OrderManager.ghostMemory.map((ghost) {
-                  return Positioned(
-                    left: ghost.lastPos.dx - 45,
-                    top: ghost.lastPos.dy - 45,
-                    child: Opacity(
-                      opacity: 0.2,
-                      child: Container(
-                        width: 90, height: 90,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          // BorderStyle.dashed 에러 수정: solid로 변경
-                          border: Border.all(color: Colors.white, width: 2, style: BorderStyle.solid),
-                        ),
-                        child: Center(
-                          child: Text(ghost.orderNo,
-                              style: const TextStyle(color: Colors.white, fontSize: 10)),
-                        ),
-                      ),
-                    ),
-                  );
-                }).toList(),
+                // ...OrderManager.ghostMemory.map((ghost) {
+                //   return Positioned(
+                //     left: ghost.lastPos.dx - 45,
+                //     top: ghost.lastPos.dy - 45,
+                //     child: Opacity(
+                //       opacity: 0.2,
+                //       child: Container(
+                //         width: 90, height: 90,
+                //         decoration: BoxDecoration(
+                //           shape: BoxShape.circle,
+                //           // BorderStyle.dashed 에러 수정: solid로 변경
+                //           border: Border.all(color: Colors.white, width: 2, style: BorderStyle.solid),
+                //         ),
+                //         child: Center(
+                //           child: Text(ghost.orderNo,
+                //               style: const TextStyle(color: Colors.white, fontSize: 10)),
+                //         ),
+                //       ),
+                //     ),
+                //   );
+                // }).toList(),
               ],
             );
           }
@@ -997,13 +1048,64 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
   final double minVideoSize = 150.0;
   final double maxVideoSize = 600.0;
 
+  bool _isFollowingPickup = false;
+  Timer? _returnTimer;
+  Offset? _targetPickupPos;
+
+  static const Duration moveDuration = Duration(milliseconds: 2500);
+  static const Duration sizeDuration = Duration(milliseconds: 1500);
+  static const Curve animationCurve = Curves.easeInOutQuart;
+
   @override
   void initState() {
     super.initState();
 
     _player = Player();
-    _controller = VideoController(_player);
-
+    _controller = VideoController(
+      _player,
+      // configuration: const VideoControllerConfiguration(
+      // // [중요] 가능한 경우 하드웨어 서피스를 직접 사용하도록 유도
+      // // media_kit 버전에 따라 지원 여부가 다를 수 있으니 문서를 확인하세요.
+      // enableHardwareAcceleration: true,
+    );
+    // WidgetsBinding.instance.addPostFrameCallback((_) async {
+    //   if (!mounted) return;
+    //
+    //   final playerPlatform = _player.platform;
+    //   if (playerPlatform is NativePlayer) {
+    //     try {
+    //       // [수정] crash를 유발하는 vo, gpu-api, opengl-pbo 설정을 제거합니다.
+    //       // 대신 하드웨어 디코딩 방식만 지정합니다.
+    //       await playerPlatform.setProperty('hwdec', 'mediacodec-copy'); // T982에서 가장 안정적
+    //
+    //       // 성능 최적화 (버퍼 및 스레드)
+    //       await playerPlatform.setProperty('vd-lavc-threads', '4');
+    //       await playerPlatform.setProperty('framedrop', 'vo');
+    //
+    //       debugPrint("🚀 [IPS_DEBUG] Stable 4K Profile Applied (Safety Mode)");
+    //     } catch (e) {
+    //       debugPrint("⚠️ HW 설정 실패: $e");
+    //     }
+    //   }
+    //
+    //   // [핵심] 보드가 리소스를 정리할 시간을 줍니다.
+    //   await Future.delayed(const Duration(seconds: 2));
+    //
+    //   if (!mounted) return;
+    //
+    //   await _player.open(
+    //       Media('asset://assets/videos/UHD_Landscape_265.mp4'),
+    //       play: false
+    //   );
+    //   await _player.setPlaylistMode(PlaylistMode.loop);
+    //
+    //   // [핵심] 비디오 위젯이 화면에 완전히 안착된 후 재생
+    //   await Future.delayed(const Duration(milliseconds: 500));
+    //   if (mounted) {
+    //     await _player.play();
+    //     findNextSafePosition();
+    //   }
+    // });
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted) return;
 
@@ -1014,13 +1116,8 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
       if (playerPlatform is NativePlayer) {
         try {
           await playerPlatform.setProperty('hwdec', 'mediacodec');
-
-          // [추가] display-desync 모드는 Flutter의 화면 갱신을 기다리지 않고
-          // 디코더가 완성되는 대로 버퍼를 밀어내어 ImageReader 정체를 완화합니다.
           await playerPlatform.setProperty('video-sync', 'display-desync');
           await playerPlatform.setProperty('framedrop', 'vo');
-
-          // 버퍼 사이즈를 최소화하여 정체 방지
           await playerPlatform.setProperty('demuxer-max-bytes', '1M');
           await playerPlatform.setProperty('cache', 'no');
 
@@ -1048,7 +1145,33 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
 
   void _handleObstacles() {
     if (!mounted) return;
-    _adjustSizeToSurroundings(widget.obstacleNotifier.value);
+
+    // 고정 모드일 때는 장애물을 만나도 위치를 옮기지 않고 '크기만' 조절합니다.
+    if (_isFollowingPickup) {
+      _adjustSizeOnly(widget.obstacleNotifier.value);
+    } else {
+      _adjustSizeToSurroundings(widget.obstacleNotifier.value);
+    }
+  }
+
+  void _adjustSizeOnly(List<Offset> obstacles) {
+    Offset currentCenter = _videoPos + Offset(_videoSize / 2, _videoSize / 2);
+    double rawSize = _calculateMaxAvailableSize(currentCenter, obstacles);
+
+    // 만약 주변 컵 때문에 영상이 너무 작아지면(minVideoSize 미만) 강제로 고정 해제하고 도망
+    if (rawSize < minVideoSize) {
+      _isFollowingPickup = false;
+      findNextSafePosition();
+      return;
+    }
+
+    double newSize = rawSize.clamp(minVideoSize, maxVideoSize);
+    if ((newSize - _videoSize).abs() < 5.0) return;
+
+    setState(() {
+      _videoSize = newSize;
+      _videoPos = currentCenter - Offset(newSize / 2, newSize / 2);
+    });
   }
 
   // 영상 길이
@@ -1057,36 +1180,57 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
     return (duration == Duration.zero) ? const Duration(seconds: 15) : duration;
   }
 
+  Offset _getStrictSafeCenter(Offset targetCenter, double targetSize) {
+    final double radius = targetSize / 2;
+    const double margin = 10.0; // 최소 10px의 물리적 여유
+
+    double minX = radius + margin;
+    double maxX = widget.screenWidth - radius - margin;
+    double minY = radius + margin;
+    double maxY = widget.screenHeight - radius - margin;
+
+    return Offset(
+      targetCenter.dx.clamp(minX, maxX),
+      targetCenter.dy.clamp(minY, maxY),
+    );
+  }
+
   // 컵이 사라진 위치로 이동 (Shrink -> Teleport -> Grow 시퀀스)
-  Future<void> moveVideoToPosition(Offset targetCenter, List<Offset> otherObstacles) async {
-    if (!mounted) return;
+  Future<void> moveVideoToPosition(Offset pickupPos, List<Offset> obstacles) async {
+    if (!mounted || _isFollowingPickup) return;
 
-    // 1. 현재 자리에서 작아지기 시작
+    _isFollowingPickup = true; // 고정 모드 활성화
+    _returnTimer?.cancel();
+
+    Offset optimizedPickupPos = pickupPos;
+    double bestPickupSize = _calculateMaxAvailableSize(pickupPos, obstacles);
+
+    for (int i = 0; i < 5; i++) {
+      double angle = i * (2 * math.pi / 5);
+      Offset offsetCandidate = pickupPos + Offset(math.cos(angle) * 80, math.sin(angle) * 80); // 80px 반경 조사
+      double candidateSize = _calculateMaxAvailableSize(offsetCandidate, obstacles);
+
+      if (candidateSize > bestPickupSize) {
+        bestPickupSize = candidateSize;
+        optimizedPickupPos = offsetCandidate;
+      }
+    }
+
+    double rawTargetSize = bestPickupSize.clamp(minVideoSize, maxVideoSize);
+    Offset finalTargetCenter = _getStrictSafeCenter(optimizedPickupPos, rawTargetSize);
+    double finalTargetSize = _calculateMaxAvailableSize(finalTargetCenter, obstacles).clamp(minVideoSize, maxVideoSize);
+    Offset finalLeftTopPos = finalTargetCenter - Offset(finalTargetSize / 2, finalTargetSize / 2);
+
     setState(() {
-      _isAdActuallyVisible = false;
+      _videoPos = finalLeftTopPos;
+      _videoSize = finalTargetSize;
     });
 
-    // 2. 애니메이션 시간만큼 대기 (IPSAnimatedWidget의 duration과 동기화)
-    // IPSAnimatedWidget의 duration이 800ms라면 800ms~1000ms 대기
-    await Future.delayed(const Duration(milliseconds: 800));
-
-    if (!mounted) return;
-
-    // 3. 보이지 않는 상태에서 좌표 및 크기 계산 (순간이동)
-    double rawSize = _calculateMaxAvailableSize(targetCenter, otherObstacles);
-    double finalSize = rawSize.clamp(minVideoSize, maxVideoSize);
-
-    setState(() {
-      _videoPos = targetCenter - Offset(finalSize / 2, finalSize / 2);
-      _videoSize = finalSize;
-    });
-
-    // 4. 위치 이동이 내부적으로 반영될 짧은 찰나 대기 (Layout 버퍼)
-    await Future.delayed(const Duration(milliseconds: 50));
-
-    // 5. 새 위치에서 다시 커지기
-    setState(() {
-      _isAdActuallyVisible = true;
+    _returnTimer = Timer(const Duration(seconds: 5), () {
+      if (mounted) {
+        _isFollowingPickup = false;
+        findNextSafePosition();
+      }
     });
   }
 
@@ -1153,32 +1297,33 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
       return;
     }
 
-    // 장애물이 있으면 랜덤 탐색
-    Offset candidatePos = Offset.zero;
-    double finalSize = 300.0;
-    bool found = false;
-    int attempts = 0;
+    Offset bestCenter = Offset.zero;
+    double bestSize = 0;
+    const int samplingCount = 20; // 20군데를 찔러보고 가장 좋은 곳 선택
 
-    while (!found && attempts < 30) { // 시도 횟수 소폭 조정하여 부하 감소
+    for (int i = 0; i < samplingCount; i++) {
+      // 랜덤 후보지 생성
       double randX = _random.nextDouble() * (widget.screenWidth - 400) + 200;
       double randY = _random.nextDouble() * (widget.screenHeight - 400) + 200;
-      Offset centerPoint = Offset(randX, randY);
+      Offset candidateCenter = Offset(randX, randY);
 
-      double rawSize = _calculateMaxAvailableSize(centerPoint, obstacles);
+      // 해당 위치에서 가능한 최대 크기 계산
+      double currentSize = _calculateMaxAvailableSize(candidateCenter, obstacles);
 
-      if (rawSize >= minVideoSize) {
-        finalSize = rawSize.clamp(minVideoSize, maxVideoSize);
-        candidatePos = centerPoint - Offset(finalSize / 2, finalSize / 2);
-        found = true;
+      // [핵심] 기존에 찾은 곳보다 더 큰 공간이면 업데이트
+      if (currentSize > bestSize) {
+        bestSize = currentSize;
+        bestCenter = candidateCenter;
       }
-      attempts++;
     }
 
-
-    if (found) {
+    // 최종 선택된 최적지로 이동
+    if (bestSize >= minVideoSize) {
+      double finalSize = bestSize.clamp(minVideoSize, maxVideoSize);
       setState(() {
-        _videoPos = candidatePos;
         _videoSize = finalSize;
+        // 이전 답변에서 적용한 안전 좌표(StrictSafe)를 사용하여 이동
+        _videoPos = _getStrictSafeCenter(bestCenter, finalSize) - Offset(finalSize / 2, finalSize / 2);
       });
     }
   }
@@ -1190,15 +1335,6 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
     super.dispose();
   }
 
-  // 부모로부터 컵 위치 데이터가 업데이트되면 실행됨
-  // @override
-  // void didUpdateWidget(FloatingVideoLayer oldWidget) {
-  //   super.didUpdateWidget(oldWidget);
-  //   // 주변 환경(컵 위치)이 바뀌면 -> 이동하지 말고 크기만 조절!
-  //   if (widget.currentObstacles != oldWidget.currentObstacles) {
-  //     _adjustSizeToSurroundings();
-  //   }
-  // }
   @override
   void didUpdateWidget(FloatingVideoLayer oldWidget) {
     super.didUpdateWidget(oldWidget);
@@ -1211,32 +1347,26 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
   @override
   Widget build(BuildContext context) {
     return AnimatedPositioned(
-      duration: const Duration(milliseconds: 1500),
-      curve: Curves.easeInOut,
+      duration: moveDuration,
+      curve: animationCurve,
       left: _videoPos.dx,
       top: _videoPos.dy,
       child: RepaintBoundary(
-        child: IPSAnimatedWidget(
-          key: const ValueKey("ad_video_anim"),
-          isExiting: !_isAdActuallyVisible,
-          // 2. 등장(0 -> 1) 속도: 테스트를 위해 10초 설정 (실제로는 2~3초 추천)
-          duration: const Duration(milliseconds: 800),
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 800),
-            curve: Curves.easeOutCubic, // 크기 변할 때 효과
-            width: _videoSize,
-            height: _videoSize,
-            decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 20)]
-            ),
-            child: ClipOval(
-              child: Video(
-                controller: _controller,
-                fit: BoxFit.cover,
-                controls: NoVideoControls,
-              ),
-            ),
+        child: AnimatedContainer(
+          duration: sizeDuration,
+          curve: animationCurve, // 크기 변할 때 효과
+          width: _videoSize,
+          height: _videoSize,
+          decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 20)]
+          ),
+          child: ClipOval(
+            child: Video(
+              controller: _controller,
+              fit: BoxFit.cover,
+              controls: NoVideoControls,
+            )
           ),
         ),
       ),

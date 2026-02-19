@@ -11,7 +11,8 @@
         android:usesCleartextTraffic="true"
         android:icon="@mipmap/ic_launcher"
         android:hardwareAccelerated="true"
-        android:largeHeap="true">
+        android:largeHeap="true"
+        android:allowNativeHeapPointerTagging="false">
 
         <meta-data
             android:name="io.flutter.embedding.android.EnableImpeller"
