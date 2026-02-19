@@ -17,14 +17,10 @@ class IPSAnimatedWidget extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return TweenAnimationBuilder<double>(
-      // ★ 중요: 나타날 땐 0->1, 사라질 땐 1->0이 되도록 begin과 end를 모두 가변 설정합니다.
-      tween: Tween<double>(
-          begin: isExiting ? 1.0 : 0.0,
-          end: isExiting ? 0.0 : 1.0
-      ),
+      tween: Tween<double>(end: isExiting ? 0.0 : 1.0),
       duration: duration,
       // 나타날 땐 탄성(easeOutBack), 사라질 땐 가속하며 소멸(easeInQuad)
-      curve: isExiting ? Curves.easeInQuad : Curves.easeOutBack,
+      curve: isExiting ? Curves.easeInCubic : Curves.easeOutBack,
       onEnd: () {
         if (isExiting) onExitFinished?.call();
       },

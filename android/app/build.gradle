@@ -49,8 +49,13 @@ android {
 
     defaultConfig {
         applicationId "com.example.aio_pickup_table"
-        minSdkVersion flutter.minSdkVersion
-        targetSdk 35
+        minSdkVersion flutter.minSdkVersion // T982 안정성 확보
+        targetSdk 31    // Android 11(API 30) 최적화 타겟 (35에서 하향 조정 추천)
+
+        // [추가] 64비트 전용 빌드로 메모리 효율 극대화
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName
     }
@@ -67,8 +72,8 @@ android {
     buildTypes {
         release {
             signingConfig signingConfigs.release
-            minifyEnabled false
-            shrinkResources false
+            minifyEnabled true
+            shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
         debug {

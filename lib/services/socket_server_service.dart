@@ -26,11 +26,13 @@ class SocketServerService {
   final Function(TofFrame) onDataReceived;
   final bool _useIpCheck = false;
   final VoidCallback? onOrderReceived;
+  final VoidCallback? onCalibrationRequested;
 
   SocketServerService({
     required this.onLog,
     required this.onDataReceived,
     this.onOrderReceived,
+    this.onCalibrationRequested,
   });
 
   // IP 접근 허용 여부 판단
@@ -114,6 +116,12 @@ class SocketServerService {
                 jsonData['menuName'] ?? "메뉴명 없음"
             );
             onOrderReceived?.call();
+            return;
+          }
+
+          if (type == 'START_CALIBRATION') {
+            onLog("🎯 KDS로부터 원격 캘리브레이션 요청 수신", force: true);
+            onCalibrationRequested?.call(); // 메인 화면으로 신호 전달
             return;
           }
 
