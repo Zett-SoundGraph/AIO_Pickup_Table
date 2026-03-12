@@ -1,53 +1,83 @@
+import 'dart:math' as math;
 import 'dart:ui';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
+
+import 'arc_text_painter.dart';
 
 // lib/components/guide_circle.dart
 
-class GuideCircle extends CustomPainter {
+class OrderGuideWidget extends StatelessWidget {
+  final String label;
   final Color color;
-  final double strokeWidth;
+  final Map<String, ui.Image> icons;
 
-  GuideCircle({
-    // 1. 색상을 조금 더 밝은 사이언 또는 화이트로 변경
+  const OrderGuideWidget({
+    super.key,
+    required this.label,
     this.color = Colors.cyanAccent,
-    this.strokeWidth = 2.5, // 두께를 살짝 키움
+    required this.icons,
   });
 
   @override
-  void paint(Canvas canvas, Size size) {
-    // 2. 빛 번짐 효과를 위한 그림자 Paint
-    final shadowPaint = Paint()
-      ..color = color.withOpacity(0.3)
-      ..strokeWidth = strokeWidth + 2
-      ..style = PaintingStyle.stroke;
+  Widget build(BuildContext context) {
+    const double size = 180.0;
+    const double guideRadius = size / 2;
+    const double textRadius = guideRadius + 25.0; // 텍스트가 그려질 궤도
+    final double dynamicFontSize = label.length > 10 ? 12.0 : 15.0;
+    // 텍스트 스타일 설정 (컵과 동일한 스타일)
+    final TextStyle labelStyle = TextStyle(
+      color: Colors.white,
+      fontSize: dynamicFontSize,
+      fontWeight: FontWeight.bold,
+      letterSpacing: 1.5,
+      fontFamilyFallback: ['Noto Color Emoji'],
+    );
 
-    // 메인 선 Paint
-    final paint = Paint()
-      ..color = color.withOpacity(0.6) // 투명도를 0.6 정도로 상향
-      ..strokeWidth = strokeWidth
-      ..style = PaintingStyle.stroke
-      ..strokeCap = StrokeCap.round;
+    // 12시 방향 중앙 정렬을 위한 각도 계산
+    final textPainter = TextPainter(
+      text: TextSpan(text: label, style: labelStyle),
+      textDirection: TextDirection.ltr,
+    )..layout();
 
-    final Path path = Path()..addOval(Rect.fromLTWH(0, 0, size.width, size.height));
+    final double totalAngle = textPainter.width / textRadius;
+    // 12시 방향(-pi/2)을 기준으로 텍스트 너비의 절반만큼 뒤로 이동
+    final double startAngle12 = -math.pi / 2 + (totalAngle / 2);
 
-    for (PathMetric pathMetric in path.computeMetrics()) {
-      double distance = 0.0;
-      const double dashWidth = 12.0; // 점선 길이를 조금 더 길게
-      const double dashSpace = 8.0;
+    return SizedBox(
+      width: size,
+      height: size,
+      child: Stack(
+        alignment: Alignment.center,
+        clipBehavior: Clip.none,
+        children: [
+          // 1. 가이드 이미지 (180도 회전 - 바리스타 시점)
+          Transform.rotate(
+            angle: math.pi,
+            child: Image.asset(
+              'assets/images/cafe_beta.png',
+              width: size,
+              height: size,
+              fit: BoxFit.contain,
+              // color: color.withOpacity(0.5), // 필요 시 색상 필터 적용 가능
+            ),
+          ),
 
-      while (distance < pathMetric.length) {
-        final extractPath = pathMetric.extractPath(distance, distance + dashWidth);
+          // 2. 12시 방향 곡선 라벨
+          CustomPaint(
+            size: const Size(size, size),
+            painter: ArcTextPainter(
+              text: label,
+              radius: textRadius,
+              startAngle: startAngle12,
+              style: labelStyle,
+              icons: icons,
+            ),
+          ),
 
-        // 그림자(빛번짐) 먼저 그리기
-        canvas.drawPath(extractPath, shadowPaint);
-        // 메인 점선 그리기
-        canvas.drawPath(extractPath, paint);
-
-        distance += dashWidth + dashSpace;
-      }
-    }
+          // 추후 여기에 Pulsing 애니메이션 등을 추가하기 매우 쉬워집니다.
+        ],
+      ),
+    );
   }
-
-  @override
-  bool shouldRepaint(CustomPainter oldDelegate) => false;
 }

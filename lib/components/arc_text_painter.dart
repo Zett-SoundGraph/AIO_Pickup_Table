@@ -1,4 +1,5 @@
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 
 class ArcTextPainter extends CustomPainter {
@@ -6,12 +7,14 @@ class ArcTextPainter extends CustomPainter {
   final double radius;
   final double startAngle;
   final TextStyle style;
+  final Map<String, ui.Image> icons;
 
   ArcTextPainter({
     required this.text,
     required this.radius,
     required this.startAngle,
     required this.style,
+    required this.icons,
   });
 
   @override
@@ -20,32 +23,55 @@ class ArcTextPainter extends CustomPainter {
 
     double currentAngle = startAngle;
 
-    for (int i = 0; i < text.length; i++) {
-      final char = text[i];
-      final textPainter = TextPainter(
-        text: TextSpan(text: char, style: style),
-        textDirection: TextDirection.ltr,
-      )..layout();
+    for (var char in text.characters) {
+      ui.Image? icon = icons[char]; // 현재 글자가 아이콘인지 확인
 
-      final charAngle = textPainter.width / radius;
+      if (icon != null) {
+        // [이미지를 그리는 경우]
+        const double iconSize = 24.0; // ✨ 화면에 표시될 아이콘 크기 (조절 가능)
+        final charAngle = iconSize / radius;
+        final x = center.dx + radius * math.cos(currentAngle - charAngle / 2);
+        final y = center.dy + radius * math.sin(currentAngle - charAngle / 2);
 
-      // 수학적 좌표 계산: x = r * cos(θ), y = r * sin(θ)
-      final x = center.dx + radius * math.cos(currentAngle - charAngle / 2);
-      final y = center.dy + radius * math.sin(currentAngle - charAngle / 2);
+        canvas.save();
+        canvas.translate(x, y);
+        canvas.rotate(currentAngle - charAngle / 2 - math.pi / 2);
 
-      canvas.save();
-      canvas.translate(x, y);
+        // 128x128 원본을 iconSize(24x24)로 축소해서 그리기
+        canvas.drawImageRect(
+          icon,
+          Rect.fromLTWH(0, 0, icon.width.toDouble(), icon.height.toDouble()),
+          Rect.fromLTWH(-iconSize / 2, -iconSize / 2, iconSize, iconSize),
+          Paint()..filterQuality = ui.FilterQuality.high,
+        );
+        canvas.restore();
+        currentAngle -= charAngle;
+      } else {
+        // [글자를 그리는 경우 - 기존 로직]
+        TextStyle finalStyle = (char == '|')
+            ? style.copyWith(color: Colors.white38)
+            : style;
 
-      // 원의 접선 방향에 맞춰 글자 회전
-      canvas.rotate(currentAngle - charAngle / 2 - math.pi / 2);
+        final textPainter = TextPainter(
+          text: TextSpan(text: char, style: finalStyle),
+          textDirection: TextDirection.ltr,
+        )..layout();
 
-      textPainter.paint(canvas, Offset(-textPainter.width / 2, -textPainter.height / 2));
-      canvas.restore();
+        final charAngle = textPainter.width / radius;
+        final x = center.dx + radius * math.cos(currentAngle - charAngle / 2);
+        final y = center.dy + radius * math.sin(currentAngle - charAngle / 2);
 
-      currentAngle -= charAngle;
+        canvas.save();
+        canvas.translate(x, y);
+        canvas.rotate(currentAngle - charAngle / 2 - math.pi / 2);
+        textPainter.paint(canvas, Offset(-textPainter.width / 2, -textPainter.height / 2));
+        canvas.restore();
+        currentAngle -= charAngle;
+      }
     }
   }
 
   @override
-  bool shouldRepaint(CustomPainter oldDelegate) => true;
+  bool shouldRepaint(ArcTextPainter oldDelegate) =>
+      oldDelegate.text != text || oldDelegate.icons != icons;
 }

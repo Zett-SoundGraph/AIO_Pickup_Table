@@ -69,8 +69,25 @@ flutter:
     - assets/videos/butterfly.mp4
     - assets/videos/video_stbs.mp4
     - assets/videos/video_stbs2.mp4
-    - assets/videos/UHD_Landscape.mp4
-    - assets/videos/UHD_Landscape_265.mp4
+    - assets/images/cafe_beta.png
+    - assets/images/drink.png
+    - assets/images/food.png
+    - assets/images/bottle.png
+
+
+  fonts:
+    - family: NotoSansKR
+      fonts:
+        - asset: assets/fonts/NotoSansKR-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/NotoSansKR-Bold.ttf
+          weight: 700
+    - family: CenturyGothic
+      fonts:
+        - asset: assets/fonts/GOTHIC.ttf
+          weight: 400
+        - asset: assets/fonts/GOTHICB.ttf
+          weight: 700
   # To add assets to your application, add an assets section, like this:
   # assets:
   #   - images/a_dot_burr.jpeg

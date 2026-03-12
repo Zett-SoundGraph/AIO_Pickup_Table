@@ -24,6 +24,7 @@ class SocketServerService {
   // UI로 데이터와 로그를 전달해줄 콜백 함수들
   final Function(String, {bool force}) onLog;
   final Function(TofFrame) onDataReceived;
+  final Function(String subType, dynamic value)? onFineTuneCommand;
   final bool _useIpCheck = false;
   final VoidCallback? onOrderReceived;
   final VoidCallback? onCalibrationRequested;
@@ -33,6 +34,7 @@ class SocketServerService {
     required this.onDataReceived,
     this.onOrderReceived,
     this.onCalibrationRequested,
+    this.onFineTuneCommand,
   });
 
   // IP 접근 허용 여부 판단
@@ -108,12 +110,23 @@ class SocketServerService {
             return; // 식별 패킷은 여기서 처리 종료
           }
 
+          if (type == 'FINE_TUNE_CONTROL') {
+            final String subType = jsonData['subType'] ?? '';
+            final dynamic value = jsonData['value'];
+            onFineTuneCommand?.call(subType, value);
+            return;
+          }
+
           // 2. KDS 주문 데이터 수신 (기존 유지)
           if (type == 'ORDER_READY') {
             onLog("📢 KDS 주문 수신: ${jsonData['orderNo']}번");
             OrderManager.addReadyOrder(
                 jsonData['orderNo'].toString(),
-                jsonData['menuName'] ?? "메뉴명 없음"
+                jsonData['menuName'] ?? "메뉴명 없음",
+                jsonData['nickname'] ?? "",
+                jsonData['drinkCount'] ?? 0,
+                jsonData['foodCount'] ?? 0,
+                jsonData['bottleCount'] ?? 0
             );
             onOrderReceived?.call();
             return;

@@ -5,12 +5,22 @@ import '../models/pickup_data.dart';
 class GhostOrder {
   final String orderNo;
   final String menuName;
+  final String nickname;
+  final Color color;
+  final int drinkCount;
+  final int foodCount;
+  final int bottleCount;
   final Offset lastPos;
   final DateTime disappearedAt;
 
   GhostOrder({
     required this.orderNo,
     required this.menuName,
+    required this.nickname,
+    required this.drinkCount,
+    required this.foodCount,
+    required this.bottleCount,
+    required this.color,
     required this.lastPos,
     required this.disappearedAt,
   });
@@ -18,9 +28,9 @@ class GhostOrder {
 
 class OrderManager {
   // 1. KDS에서 들어온 제조 완료 주문들 (대기열)
-  static final List<Map<String, String>> _waitingQueue = [];
+  static final List<Map<String, dynamic>> _waitingQueue = [];
 
-  static List<Map<String, String>> get waitingQueue => List.unmodifiable(_waitingQueue);
+  static List<Map<String, dynamic>> get waitingQueue => List.unmodifiable(_waitingQueue);
 
   // 2. 현재 테이블 위에 올라가 있는 컵(ToF ID)과 매칭된 주문 정보
   // Key: ToF ID (물리 ID), Value: { orderNo, menuName } (비즈니스 데이터)
@@ -40,11 +50,11 @@ class OrderManager {
   // [KDS 연동] 소켓 서버에서 호출
   static const int maxQueueSize = 50;
 
-  static void addReadyOrder(String no, String menu) {
+  static void addReadyOrder(String no, String menu, String nickname, int d, int f, int b) {
     if (_waitingQueue.length >= maxQueueSize) {
       _waitingQueue.removeAt(0); // 너무 오래된 주문은 밀어냄
     }
-    _waitingQueue.add({"orderNo": no, "menuName": menu});
+    _waitingQueue.add({"orderNo": no, "menuName": menu, "nickname": nickname, "drinkCount": d, "foodCount": f, "bottleCount": b});
     print("📦 [Manager] 대기열 추가: $no | 현재 대기: ${_waitingQueue.length}건");
   }
 
@@ -53,7 +63,7 @@ class OrderManager {
   }
 
   // [ToF 연동] 새로운 컵이 감지되었을 때 호출 (기존 유지)
-  static Map<String, dynamic>? getOrAssignOrder(int tofId, Offset currentPos) {
+  static Map<String, dynamic>? getOrAssignOrder(int tofId, Offset currentPos, Color initialColor) {
     _cleanupGhosts();
     if (_activeMatches.containsKey(tofId)) {
       _activeMatches[tofId]!['pos'] = currentPos;
@@ -74,6 +84,11 @@ class OrderManager {
       final reclaimed = {
         "orderNo": matchedGhost.orderNo,
         "menuName": matchedGhost.menuName,
+        "nickname": matchedGhost.nickname,
+        "color": matchedGhost.color,
+        "drinkCount": matchedGhost.drinkCount,
+        "foodCount": matchedGhost.foodCount,
+        "bottleCount": matchedGhost.bottleCount,
         "pos": currentPos
       };
       _activeMatches[tofId] = reclaimed;
@@ -85,6 +100,11 @@ class OrderManager {
       final newMatch = {
         "orderNo": assigned['orderNo']!,
         "menuName": assigned['menuName']!,
+        "nickname": assigned['nickname']!,
+        "drinkCount": assigned['drinkCount'],
+        "foodCount": assigned['foodCount'],
+        "bottleCount": assigned['bottleCount'],
+        "color": initialColor,
         "pos": currentPos
       };
       _activeMatches[tofId] = newMatch;
@@ -102,6 +122,11 @@ class OrderManager {
         _ghostMemory.add(GhostOrder(
           orderNo: removed['orderNo'],
           menuName: removed['menuName'],
+          nickname: removed['nickname'] ?? "",
+          drinkCount: removed['drinkCount'] ?? 0,
+          foodCount: removed['foodCount'] ?? 0,
+          bottleCount: removed['bottleCount'] ?? 0,
+          color: removed['color'],
           lastPos: removed['pos'],
           disappearedAt: DateTime.now(),
         ));
@@ -125,4 +150,6 @@ class OrderManager {
     g.orderNo == orderNo && (g.lastPos - pos).distance < 30.0
     );
   }
+
+  static Map<int, Map<String, dynamic>> get activeMatches => _activeMatches;
 }
