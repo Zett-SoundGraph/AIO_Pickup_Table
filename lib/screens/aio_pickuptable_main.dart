@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 import 'package:aio_pickup_table/components/guide_circle.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -24,9 +25,9 @@ import 'calibration_screen.dart';
 
 class LogItem {
   final String timestamp; // 시간
-  final String type;      // RX, TX, SYS, MOVE 등
-  final String message;   // 로그 내용
-  final int? frameId;     // 프레임 ID (색상 구분용, null이면 시스템 로그)
+  final String type; // RX, TX, SYS, MOVE 등
+  final String message; // 로그 내용
+  final int? frameId; // 프레임 ID (색상 구분용, null이면 시스템 로그)
   final int? objectId;
 
   LogItem({
@@ -43,10 +44,12 @@ class DetectedObject {
   final int id;
   final String orderNo; // 그룹핑 기준
   final Offset position; // 좌표 (x, y)
-  final double zValue;   // 높이
+  final double zValue; // 높이
   final double diameter; // 지름
   final double uiWidth;
   final double uiHeight;
+  final double labelAngle;
+  final Color color;
 
   DetectedObject({
     required this.id,
@@ -56,6 +59,8 @@ class DetectedObject {
     required this.diameter,
     required this.uiWidth,
     required this.uiHeight,
+    this.labelAngle = 1.0,
+    required this.color,
   });
 }
 
@@ -75,21 +80,17 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
   List<DetectedObject> exitingObjects = [];
   List<DetectedObject> hands = [];
 
-  // 화면 배율 (테이블 크기에 맞춰 조절)
-  final double scaleRatio = 3.17;
-  final double sizeCorrection = 0.75;
-
   // 로그 제어용 변수
   bool _showRawData = true;
   List<TofObject> _lastFrameObjects = [];
   final double _movementThreshold = 2.0;
 
-  // 시계 표시용 변수 및 타이머
-  String _currentTimeStr = "00:00:00";
-  Timer? _clockTimer;
-
   bool _isHandDetected = false;
   Timer? _handDetectionTimer;
+
+  Map<String, ui.Image> _iconImages = {};
+
+  final GlobalKey<CalibrationScreenState> _calibKey = GlobalKey<CalibrationScreenState>();
 
   void _resetHandDetectionTimer() {
     // 기존 타이머가 있다면 취소
@@ -101,7 +102,7 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
           _isHandDetected = false;
           hands = []; // 손 데이터도 초기화
         });
-        _addLog("SYS", "👋 손 감지 시간 초과: 효과 해제", force: true);
+        //_addLog("SYS", "👋 손 감지 시간 초과: 효과 해제", force: true);
       }
     });
   }
@@ -122,45 +123,95 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
 
 // ID를 기반으로 색상을 가져오는 헬퍼 함수
   Color _getColorForId(int id) {
-    if (id < 0) return Colors.white54; // 시스템 로그용
+    if (id < 0) return Colors.white54;
     return _idPalette[id % _idPalette.length];
+  }
+
+  String _getGuideLabel(String orderNo) {
+    // 대기열에서 해당 주문번호와 일치하는 데이터를 찾습니다.
+    final orderData = OrderManager.waitingQueue.firstWhere(
+          (o) => o['orderNo'] == orderNo,
+      // 만약 대기열에 없다면(거의 없겠지만 안전하게) 기본 주문번호 반환
+      orElse: () => {'nickname': '', 'orderNo': orderNo},
+    );
+    return _buildComplexLabel(orderData);
   }
 
   @override
   void initState() {
     super.initState();
-    _loadSavedMatrix();
+    _loadSavedCalibration();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     _initializeServer();
     _logCurrentServerIp();
-    _startClock();
+    _loadIcons();
   }
 
-  Future<void> _loadSavedMatrix() async {
-    final prefs = await SharedPreferences.getInstance();
-    final String? matrixJson = prefs.getString('homography_matrix');
+  Future<void> _loadIcons() async {
+    _iconImages['☕'] = await _loadImage('assets/images/drink.png');
+    _iconImages['🥪'] = await _loadImage('assets/images/food.png');
+    _iconImages['🍾'] = await _loadImage('assets/images/bottle.png');
+    if (mounted) setState(() {}); // 로드 완료 후 화면 갱신
+  }
 
+  Future<ui.Image> _loadImage(String assetPath) async {
+    final data = await rootBundle.load(assetPath);
+    final bytes = data.buffer.asUint8List();
+    final codec = await ui.instantiateImageCodec(bytes);
+    final frame = await codec.getNextFrame();
+    return frame.image;
+  }
+
+  Future<void> _loadSavedCalibration() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    // 1. 호모그래피 행렬 불러오기
+    final String? matrixJson = prefs.getString('homography_matrix');
     if (matrixJson != null) {
       try {
         List<double> matrix = List<double>.from(jsonDecode(matrixJson));
         CoordinateTransformer.setHomographyMatrix(matrix);
-        _addLog("SYS", "✅ 이전 캘리브레이션 설정을 불러왔습니다.", force: true);
+        //debugPrint("✅ [Load] Homography Matrix restored.");
       } catch (e) {
-        _addLog("ERR", "설정 로드 실패: $e", force: true);
+        //debugPrint("❌ [Error] Matrix load failed: $e");
+      }
+    }
+
+    // final double? savedFL = prefs.getDouble('focal_length');
+    // if (savedFL != null) {
+    //   CoordinateTransformer.focalLength = savedFL;
+    //   debugPrint("✅ [Load] FocalLength restored: $savedFL");
+    // }
+
+    // 2. [추가] 미세 조정 잔차 데이터 불러오기
+    final String? residualJson = prefs.getString('calibration_residuals');
+    if (residualJson != null) {
+      try {
+        List<dynamic> decoded = jsonDecode(residualJson);
+        List<Offset> residuals = decoded.map((item) =>
+            Offset(item['dx'] as double, item['dy'] as double)
+        ).toList();
+
+        CoordinateTransformer.updateResiduals(residuals);
+        //debugPrint("✅ [Load] Calibration Residuals restored.");
+      } catch (e) {
+        //debugPrint("❌ [Error] Residuals load failed: $e");
       }
     }
   }
 
-  // 실시간 시계 타이머
-  void _startClock() {
-    _clockTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (mounted) {
-        final now = DateTime.now();
-        setState(() {
-          _currentTimeStr = "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}";
-        });
-      }
-    });
+  String _buildComplexLabel(Map<String, dynamic> info) {
+    List<String> icons = [];
+    if ((info['drinkCount'] ?? 0) > 0) icons.add("☕${info['drinkCount']}");
+    if ((info['foodCount'] ?? 0) > 0) icons.add("🥪${info['foodCount']}");
+    if ((info['bottleCount'] ?? 0) > 0) icons.add("🍾${info['bottleCount']}");
+
+    String prefix = icons.isNotEmpty ? "${icons.join(" ")} | " : "";
+    String name = (info['nickname'] != null && info['nickname'] != "")
+        ? info['nickname']
+        : "NO.${info['orderNo']}";
+
+    return "$prefix$name";
   }
 
   bool _hasSignificantChange(List<TofObject> newObjs, List<TofObject> oldObjs) {
@@ -171,8 +222,16 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
     for (var newObj in newObjs) {
       // ID가 같은 이전 객체 찾기
       var oldObj = oldObjs.firstWhere(
-            (o) => o.id == newObj.id,
-        orElse: () => TofObject(id: -1, x: 0, y: 0, z: 0, diameter: 0, width: 0, height: 0, isStable: false),
+        (o) => o.id == newObj.id,
+        orElse: () => TofObject(
+            id: -1,
+            x: 0,
+            y: 0,
+            z: 0,
+            diameter: 0,
+            width: 0,
+            height: 0,
+            isStable: false),
       );
 
       // (예외 방어) 이전 프레임에 없는 ID가 생겼다면 변화로 간주
@@ -203,37 +262,35 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
       for (var interface in interfaces) {
         // 내부 루프백(127.0.0.1)이 아닌 실제 통신용 IP 찾기
         var addr = interface.addresses.firstWhere(
-              (a) => !a.address.startsWith('127'),
+          (a) => !a.address.startsWith('127'),
           orElse: () => interface.addresses.first,
         );
 
-        _addLog("SYS", "========================================", force: true);
-        _addLog("SYS", " WebSocket Server Running ", force: true);
-        _addLog("SYS", " IP Address : ${addr.address} ", force: true);
-        _addLog("SYS", " Port       : ${AppConstants.serverPort} ", force: true);
-        _addLog("SYS", "========================================", force: true);
+        //_addLog("SYS", "========================================", force: true);
+        //_addLog("SYS", " WebSocket Server Running ", force: true);
+        //_addLog("SYS", " IP Address : ${addr.address} ", force: true);
+        //_addLog("SYS", " Port       : ${AppConstants.serverPort} ",
+        //    force: true);
+        //_addLog("SYS", "========================================", force: true);
 
         return;
       }
     } catch (e) {
-      _addLog("SYS", "IP 주소 조회 실패: $e", force: true);
+      //_addLog("SYS", "IP 주소 조회 실패: $e", force: true);
     }
   }
 
   bool _isConsoleOpen = false;
-  //bool _showRawData = false;
-  //final List<String> _consoleLogs = [];
   final List<LogItem> _consoleLogs = [];
   final ScrollController _scrollController = ScrollController();
 
-  final GlobalKey<FloatingVideoLayerState> _videoLayerKey = GlobalKey<FloatingVideoLayerState>();
-  bool _isAdPlaying = false;
+  final GlobalKey<FloatingVideoLayerState> _videoLayerKey =
+      GlobalKey<FloatingVideoLayerState>();
   Timer? _adTimer;
 
-
-  void _addLog(String type, String message, {int? frameId, int? objectId, bool force = false}) {
+  void _addLog(String type, String message,
+      {int? frameId, int? objectId, bool force = false}) {
     if (!mounted) return;
-    //if (!_isConsoleOpen && !force) return;
     if (_consoleLogs.length > 50) _consoleLogs.removeAt(0);
 
     String time = DateTime.now().toIso8601String().substring(11, 19);
@@ -256,65 +313,113 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
   }
 
   void _processCalibration(List<CalibrationPair> data) async {
-    _addLog("SYS", "🎯 9-Point Calibration Data Collected");
+    //_addLog("SYS", "🎯 9-Point Calibration Data Collected");
 
-    List<Point<double>> srcPoints = data.map((e) => Point(e.src.dx, e.src.dy)).toList();
-    List<Point<double>> dstPoints = data.map((e) => Point(e.dst.dx, e.dst.dy)).toList();
+    List<Point<double>> srcPoints =
+        data.map((e) => Point(e.src.dx, e.src.dy)).toList();
+    List<double> zs = data.map((e) => e.z).toList();
+    List<Point<double>> dstPoints =
+        data.map((e) => Point(e.dst.dx, e.dst.dy)).toList();
 
     try {
       // 1. 호모그래피 행렬 계산 (한 번만 수행)
-      final Matrix hMatrix = HomographySolver.solve(srcPoints, dstPoints);
+      final Matrix hMatrix = HomographySolver.solve(srcPoints, zs, dstPoints);
 
       String matrixLog = "";
-      for(int i=0; i<3; i++) {
-        matrixLog += "[${hMatrix[i][0].toStringAsFixed(4)}, ${hMatrix[i][1].toStringAsFixed(4)}, ${hMatrix[i][2].toStringAsFixed(4)}] ";
+      for (int i = 0; i < 3; i++) {
+        matrixLog +=
+            "[${hMatrix[i][0].toStringAsFixed(4)}, ${hMatrix[i][1].toStringAsFixed(4)}, ${hMatrix[i][2].toStringAsFixed(4)}] ";
       }
       debugPrint("📊 생성된 행렬: $matrixLog");
 
       // 2. 행렬 값 리스트화 및 적용
       List<double> matrixValues = [
-        hMatrix[0][0], hMatrix[0][1], hMatrix[0][2],
-        hMatrix[1][0], hMatrix[1][1], hMatrix[1][2],
-        hMatrix[2][0], hMatrix[2][1], hMatrix[2][2],
+        hMatrix[0][0],
+        hMatrix[0][1],
+        hMatrix[0][2],
+        hMatrix[1][0],
+        hMatrix[1][1],
+        hMatrix[1][2],
+        hMatrix[2][0],
+        hMatrix[2][1],
+        hMatrix[2][2],
       ];
-      CoordinateTransformer.setHomographyMatrix(matrixValues);
+      List<Offset> residuals = data.map((e) => e.residual).toList();
 
-      // 3. 로컬 저장소에 저장
+      CoordinateTransformer.setHomographyMatrix(matrixValues);
+      CoordinateTransformer.updateResiduals(residuals);
+
       final prefs = await SharedPreferences.getInstance();
+
       await prefs.setString('homography_matrix', jsonEncode(matrixValues));
-      _addLog("SYS", "🎯 캘리브레이션 완료 및 저장 성공!");
+
+      // ✅ [추가] Solver가 찾아낸 최적의 focalLength를 저장합니다.
+      await prefs.setDouble('focal_length', CoordinateTransformer.focalLength);
+
+      // 잔차 저장
+      List<Map<String, double>> residualMap =
+      residuals.map((r) => {'dx': r.dx, 'dy': r.dy}).toList();
+      await prefs.setString('calibration_residuals', jsonEncode(residualMap));
+
+      debugPrint("✅ [Storage] Matrix & Residuals successfully saved.");
+      //_addLog("SYS", "🎯 캘리브레이션 완료 및 저장 성공!");
 
       // 4. ROI 역산 및 라즈베리파이 전송
       final Matrix invH = hMatrix.inverse(); // 역행렬 계산
       final List<Map<String, dynamic>> roiConfigs = [
-        {"id": 1, "name": "Top-Left", "pos": const Offset(100, 100)},
-        {"id": 2, "name": "Top-Right", "pos": const Offset(1770, 100)},
-        {"id": 3, "name": "Bottom-Left", "pos": const Offset(100, 1030)},
-        {"id": 4, "name": "Bottom-Right", "pos": const Offset(1770, 1030)},
-        {"id": 5, "name": "Center", "pos": const Offset(935, 565)},
+        {"id": 1, "name": "Top-Left", "pos": const Offset(0, 0)},
+        {"id": 2, "name": "Top-Right", "pos": const Offset(1920, 0)}, // 1920 -> 2050
+        {"id": 3, "name": "Bottom-Left", "pos": const Offset(0, 1080)},
+        {"id": 4, "name": "Bottom-Right", "pos": const Offset(1920, 1080)}, // 1080 -> 1180
+        {"id": 5, "name": "Center", "pos": const Offset(960, 540)},
       ];
 
       List<Map<String, dynamic>> roiPoints = [];
-      _addLog("SYS", "📡 ROI Mapping (UI -> Camera Raw)");
+      //_addLog("SYS", "📡 ROI Mapping (UI -> Camera Raw)");
 
       for (var config in roiConfigs) {
         final int id = config["id"];
         final String name = config["name"];
         final Offset uiPos = config["pos"];
 
-        // 호모그래피 역행렬을 이용한 좌표 변환 공식
-        // x' = (h11*x + h12*y + h13) / (h31*x + h32*y + h33)
+        // 1단계: 역 호모그래피 (UI -> 지면)
         double den = invH[2][0] * uiPos.dx + invH[2][1] * uiPos.dy + invH[2][2];
-        double rx = (invH[0][0] * uiPos.dx + invH[0][1] * uiPos.dy + invH[0][2]) / den;
-        double ry = (invH[1][0] * uiPos.dx + invH[1][1] * uiPos.dy + invH[1][2]) / den;
+        double gx = (invH[0][0] * uiPos.dx + invH[0][1] * uiPos.dy + invH[0][2]) / den;
+        double gy = (invH[1][0] * uiPos.dx + invH[1][1] * uiPos.dy + invH[1][2]) / den;
 
-        _addLog("ROI", "ID:$id ($name): Raw(${rx.toStringAsFixed(1)}, ${ry.toStringAsFixed(1)})");
+        // 2단계: 역 렌즈 보정 (지면 -> 센서 Raw)
+        double rawX = gx;
+        double rawY = gy;
+        const double cx = CoordinateTransformer.opticalCenterX;
+        const double cy = CoordinateTransformer.opticalCenterY;
+        const double k1_for_roi = 0.0;
+
+        if (k1_for_roi != 0) {
+          for (int i = 0; i < 5; i++) {
+            double nx = (rawX - cx) / CoordinateTransformer.focalLength;
+            double ny = (rawY - cy) / CoordinateTransformer.focalLength;
+            double r2 = nx * nx + ny * ny;
+            double distortion = 1 + k1_for_roi * r2;
+            rawX = cx + (gx - cx) / distortion;
+            rawY = cy + (gy - cy) / distortion;
+          }
+        }
+        // // 호모그래피 역행렬을 이용한 좌표 변환 공식
+        // // x' = (h11*x + h12*y + h13) / (h31*x + h32*y + h33)
+        // double den = invH[2][0] * uiPos.dx + invH[2][1] * uiPos.dy + invH[2][2];
+        // double rx =
+        //     (invH[0][0] * uiPos.dx + invH[0][1] * uiPos.dy + invH[0][2]) / den;
+        // double ry =
+        //     (invH[1][0] * uiPos.dx + invH[1][1] * uiPos.dy + invH[1][2]) / den;
+
+        //_addLog("ROI",
+        //    "ID:$id ($name): Raw(${rx.toStringAsFixed(1)}, ${ry.toStringAsFixed(1)})");
 
         // 전송용 리스트에 ID와 좌표 추가
         roiPoints.add({
           "id": id,
-          "x": rx,
-          "y": ry,
+          "x": rawX,
+          "y": rawY,
         });
       }
 
@@ -323,16 +428,13 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
         "timestamp": DateTime.now().toIso8601String(),
         "roi_points": roiPoints,
       }));
-      _addLog("SYS", "📤 ROI Packet Sent to Raspberry Pi");
-
+      //_addLog("SYS", "📤 ROI Packet Sent to Raspberry Pi");
     } catch (e) {
-      _addLog("ERR", "Calibration/ROI Error: $e");
+      //_addLog("ERR", "Calibration/ROI Error: $e");
     }
   }
-  final Map<String, Timer> _pickupTimers = {};
 
-  DateTime? _lastUiUpdateTime;
-  static const Duration _uiThrottleRate = Duration(milliseconds: 40);
+  final Map<String, Timer> _pickupTimers = {};
 
   void _initializeServer() {
     _serverService = SocketServerService(
@@ -345,55 +447,74 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
           setState(() {
             CoordinateTransformer.resetMatrix();
             // 센서(RPi)에게도 캘리브레이션 모드임을 알림
-            _serverService.sendMessage(jsonEncode({"event_type": "cal_restart"}));
+            _serverService
+                .sendMessage(jsonEncode({"event_type": "cal_restart"}));
             _isCalibrating = true;
           });
+        },
+
+        onFineTuneCommand: (subType, value) {
+          if (!_isCalibrating) return;
+
+          switch (subType) {
+            case 'START':
+              _calibKey.currentState?.externalEnterFineTune();
+              break;
+            case 'SELECT':
+              _calibKey.currentState?.externalSelectPoint(value as int);
+              break;
+            case 'MOVE':
+              double dx = (value['dx'] as num).toDouble();
+              double dy = (value['dy'] as num).toDouble();
+              _calibKey.currentState?.externalAdjust(dx, dy);
+              break;
+            case 'COMPLETE':
+              _calibKey.currentState?.externalComplete();
+              _serverService.sendToRole("KDS", jsonEncode({"type": "VALIDATION_MODE"}));
+              break;
+          }
         },
         onDataReceived: (TofFrame frame) {
           if (frame.baseZ != null) {
             CoordinateTransformer.updateFloorHeight(frame.baseZ!);
           }
-          // final now = DateTime.now();
-          // if (_lastUiUpdateTime != null &&
-          //     now.difference(_lastUiUpdateTime!) < _uiThrottleRate) {
-          //   return;
-          // }
-          // _lastUiUpdateTime = now;
           if (frame.objects.isNotEmpty) {
             var obj = frame.objects.first;
             setState(() {
               _latestRawForCalib = CoordinateTransformer.getParallaxCorrectedOffset(obj.x, obj.y, obj.z);
+              _lastFrameObjects = frame.objects;
             });
           }
 
-          // [핵심 수정] 하지만 컵/손 관리 로직(UI 위젯 생성)은 캘리브레이션 중에는 중단
+          // 하지만 컵/손 관리 로직(UI 위젯 생성)은 캘리브레이션 중에는 중단
           if (_isCalibrating) return;
           if (frame.eventType == 'object_tracking') {
             _processHandTracking(frame); // 손(Hand) 전용
           } else {
-            _processCupUpdate(frame);    // 컵(Cup) 전용 (기존 로직)
+            _processCupUpdate(frame); // 컵(Cup) 전용
           }
-        }
-    );
+        });
     _serverService.startServer();
   }
 
   void _processHandTracking(TofFrame frame) {
-    // [추가] 콘솔 로그 출력 로직
+    // 콘솔 로그 출력 로직
     if (_isConsoleOpen && _showRawData && frame.frameId % 5 == 0) {
-      _addLog("TRK", "=== [Tracking] Frame: ${frame.frameId} (Count: ${frame.objects.length}) ===", frameId: frame.frameId);
+      //_addLog("TRK",
+      //    "=== [Tracking] Frame: ${frame.frameId} (Count: ${frame.objects.length}) ===",
+      //    frameId: frame.frameId);
       for (var obj in frame.objects) {
-        _addLog(
-          "TRK",
-          "  > [HandID:${obj.id}] "
-              "x:${obj.x.toStringAsFixed(0)}, "
-              "y:${obj.y.toStringAsFixed(0)}, "
-              "z:${obj.z.toStringAsFixed(0)}, "
-              "w:${obj.width.toStringAsFixed(0)}, "
-              "h:${obj.height.toStringAsFixed(0)}",
-          frameId: frame.frameId,
-          objectId: obj.id,
-        );
+        //_addLog(
+        //  "TRK",
+        //  "  > [HandID:${obj.id}] "
+        //       "x:${obj.x.toStringAsFixed(0)}, "
+        //       "y:${obj.y.toStringAsFixed(0)}, "
+        //       "z:${obj.z.toStringAsFixed(0)}, "
+        //       "w:${obj.width.toStringAsFixed(0)}, "
+        //       "h:${obj.height.toStringAsFixed(0)}",
+        //   frameId: frame.frameId,
+        //   objectId: obj.id,
+        // );
       }
     }
 
@@ -415,166 +536,189 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
           diameter: 0,
           uiWidth: CoordinateTransformer.getUiSize(tof.width, tof.height).width,
           uiHeight: CoordinateTransformer.getUiSize(tof.width, tof.height).height,
+          color: Colors.white70,
         );
       }).toList();
     });
   }
 
+  // 1. _processCupUpdate 수정 버전
   void _processCupUpdate(TofFrame frame) {
-    final validTofObjects = frame.objects.where((obj) =>
-    obj.x != 0 && obj.y != 0
-    ).toList();
+    final validTofObjects = frame.objects.where((obj) => obj.x > 5 && obj.y > 5).toList();
 
-    // 단일 setState로 통합 (초당 렌더링 부하 감소)
-    setState(() {
-      _handDetectionTimer?.cancel();
-      if (_isHandDetected) {
-        setState(() => _isHandDetected = false);
+    if (validTofObjects.isNotEmpty) {
+      debugPrint("☕ [RAW_CUP_FRAME] ID:${frame.frameId}");
+      for (var obj in validTofObjects) {
+        debugPrint("   > [ID:${obj.id.toString().padLeft(3)}] "
+            "x:${obj.x.toStringAsFixed(0).padLeft(3)}, "
+            "y:${obj.y.toStringAsFixed(0).padLeft(3)}, "
+            "z:${obj.z.toStringAsFixed(0).padLeft(4)}, "
+            "w:${obj.width.toStringAsFixed(0).padLeft(3)}, "
+            "h:${obj.height.toStringAsFixed(0).padLeft(3)}, "
+            "r:${(obj.diameter / 2).toStringAsFixed(1).padLeft(4)}");
       }
-      // [로그 1] 캘리브레이션용 좌표 (전체 데이터 기준)
-      if (frame.objects.isNotEmpty) {
-        var obj = frame.objects.first;
-        _latestRawForCalib = CoordinateTransformer.getParallaxCorrectedOffset(obj.x, obj.y, obj.z);
-      } else {
-        _latestRawForCalib = null;
+    }
+
+    List<Map<String, dynamic>> sensorInputs = validTofObjects.map((tof) {
+      Offset calibratedPos = CoordinateTransformer.transform(tof.x, tof.y, tof.z, showLog: true);
+      Color idBasedColor = _getColorForId(tof.id);
+      final orderInfo = OrderManager.getOrAssignOrder(tof.id, calibratedPos, idBasedColor);
+
+      String displayLabel = "UNKNOWN"; // 기본값
+      if (orderInfo != null) {
+        displayLabel = _buildComplexLabel(orderInfo);
       }
+      return {'id': tof.id, 'pos': calibratedPos, 'raw': tof, 'label': displayLabel, 'finalColor': orderInfo?['color'] ?? Colors.white54};
+    }).toList();
 
-      // [로그 2] 화면 콘솔 로그 (기존 로직 및 색상 유지)
-      bool isChanged = _hasSignificantChange(frame.objects, _lastFrameObjects);
-      if (_isConsoleOpen && (_showRawData || isChanged)) {
-        String tag = (!_showRawData && isChanged) ? "MOVE" : "RX";
-        _addLog(tag, "=== Frame: ${frame.frameId} (Count: ${frame.objects.length}, BaseZ: ${frame.baseZ?.toStringAsFixed(1)}) ===", frameId: frame.frameId);
-        for (var obj in frame.objects) {
-          _addLog(
-              tag,
-              "  > [ID:${obj.id}] "
-                  "x:${obj.x.toStringAsFixed(0)}, "
-                  "y:${obj.y.toStringAsFixed(0)}, "
-                  "z:${obj.z.toStringAsFixed(0)}, "
-                  "w:${obj.width.toStringAsFixed(0)}, "
-                  "h:${obj.height.toStringAsFixed(0)}, "
-                  "r:${(obj.diameter / 2).toStringAsFixed(1)}",
-              frameId: frame.frameId,
-              objectId: obj.id
-          );
-        }
-      }
-      _lastFrameObjects = frame.objects;
-      _currentLatestFrameId = frame.frameId;
+    List<DetectedObject> tempList = [];
 
-      // 2. 실제 UI 변환 (필터링된 데이터만 사용)
-      List<Map<String, dynamic>> sensorInputs = validTofObjects.map((tof) {
-        Offset calibratedPos = CoordinateTransformer.transform(tof.x, tof.y, tof.z);
+    // 2. 기존 컵 유지 및 매칭
+    for (var existing in objects) {
+      int closestIndex = -1;
+      double minDistance = 50.0;
 
-        // 터미널 디버그 로그 (유지)
-        debugPrint("[CALIB] ID:${tof.id} | Raw(${tof.x.toInt()}, ${tof.y.toInt()}) -> UI(${calibratedPos.dx.toInt()}, ${calibratedPos.dy.toInt()})");
-
-        return {
-          'id': tof.id,
-          'pos': calibratedPos,
-          'raw': tof
-        };
-      }).toList();
-
-      List<DetectedObject> nextObjects = [];
-
-      // 3. 기존 컵 유지 및 매칭 (기존 로직 유지)
-      for (var existing in objects) {
-        int closestIndex = -1;
-        double minDistance = 50.0;
-
-        for (int i = 0; i < sensorInputs.length; i++) {
-          double dist = (existing.position - (sensorInputs[i]['pos'] as Offset)).distance;
-          if (dist < minDistance) {
-            minDistance = dist;
-            closestIndex = i;
-          }
-        }
-
-        if (closestIndex != -1) {
-          var matched = sensorInputs.removeAt(closestIndex);
-          var tof = matched['raw'] as TofObject;
-
-          _pickupTimers[existing.orderNo]?.cancel();
-          _pickupTimers.remove(existing.orderNo);
-
-          OrderManager.getOrAssignOrder(matched['id'], matched['pos']);
-
-          nextObjects.add(DetectedObject(
-            id: matched['id'], orderNo: existing.orderNo, position: matched['pos'],
-            zValue: tof.z, diameter: CoordinateTransformer.getUiDiameter(tof.diameter),
-            uiWidth: CoordinateTransformer.getUiSize(tof.width, tof.height).width,
-            uiHeight: CoordinateTransformer.getUiSize(tof.width, tof.height).height,
-          ));
-        } else {
-          final Offset pickupPosition = existing.position;
-          final List<Offset> currentCupPositions = sensorInputs.map((e) => e['pos'] as Offset).toList();
-
-          // 2. GlobalKey를 통해 FloatingVideoLayer의 이동 함수 호출
-          _videoLayerKey.currentState?.moveVideoToPosition(pickupPosition, currentCupPositions);
-          // 픽업 완료 처리
-          final removedOrder = OrderManager.releaseId(existing.id);
-          if (removedOrder != null && removedOrder['orderNo'] != "UNKNOWN") {
-
-            String oNo = removedOrder['orderNo'].toString();
-            String mName = removedOrder['menuName'].toString();
-
-            _pickupTimers[oNo]?.cancel();
-
-            // cleanup에 의해 삭제되기 직전에 KDS 신호를 보냅니다.
-            _pickupTimers[oNo] = Timer(OrderManager.ghostDuration, () {
-              if (!mounted) return;
-
-              _serverService.sendToRole("KDS", jsonEncode({
-                "type": "PICKUP_COMPLETE",
-                "orderNo": oNo,
-                "menuName": mName,
-              }));
-
-              _addLog("TX", "📤 KDS로 픽업 완료 신호 전송: No.$oNo");
-
-              setState(() {
-                _pickupTimers.remove(oNo);
-              });
-            });
-          }
-          exitingObjects.add(existing);
+      for (int i = 0; i < sensorInputs.length; i++) {
+        double dist = (existing.position - (sensorInputs[i]['pos'] as Offset)).distance;
+        if (dist < minDistance) {
+          minDistance = dist;
+          closestIndex = i;
         }
       }
 
-      // 4. 신규 컵 추가
-      for (var nuevo in sensorInputs) {
-        var tof = nuevo['raw'] as TofObject;
-
-        final orderInfo = OrderManager.getOrAssignOrder(tof.id, nuevo['pos']);
-
-        String oNo = "UNKNOWN"; // 기본값
-        if (orderInfo != null) {
-          oNo = orderInfo['orderNo'].toString();
-          // 주문 번호가 있다면 타이머 취소
-          _pickupTimers[oNo]?.cancel();
-          _pickupTimers.remove(oNo);
-        }
-
-        // orderInfo가 null이더라도(UNKNOWN이더라도) 리스트에는 추가하여 원을 그려줌
-        nextObjects.add(DetectedObject(
-          id: tof.id,
-          orderNo: oNo,
-          position: nuevo['pos'],
+      if (closestIndex != -1) {
+        var matched = sensorInputs.removeAt(closestIndex);
+        var tof = matched['raw'] as TofObject;
+        tempList.add(DetectedObject(
+          id: matched['id'],
+          orderNo: matched['label'],
+          position: matched['pos'],
           zValue: tof.z,
           diameter: CoordinateTransformer.getUiDiameter(tof.diameter),
           uiWidth: CoordinateTransformer.getUiSize(tof.width, tof.height).width,
           uiHeight: CoordinateTransformer.getUiSize(tof.width, tof.height).height,
+          color: matched['finalColor'],
         ));
+      } else {
+        // 컵이 사라질 때 처리
+        final removedOrder = OrderManager.releaseId(existing.id);
+        exitingObjects.add(existing);
+
+        if (removedOrder != null && removedOrder['orderNo'] != "UNKNOWN") {
+          String actualOrderNo = removedOrder['orderNo'].toString();
+          String mName = removedOrder['menuName'].toString();
+
+          // 기존 타이머가 있다면 취소 (고스트 재매칭 시 픽업 취소를 위함)
+          _pickupTimers[actualOrderNo]?.cancel();
+
+          // 2. 5초(고스트 시간) 대기 타이머 시작
+          _pickupTimers[actualOrderNo] = Timer(OrderManager.ghostDuration, () {
+            if (!mounted) return;
+
+            bool isStillOnTable = OrderManager.activeMatches.values.any(
+                    (match) => match['orderNo'].toString() == actualOrderNo
+            );
+
+            // 2. 유령 대기열(ghostMemory)에 이 주문번호를 가진 유령이 하나라도 남아있는가?
+            // (방금 사라진 이 컵 말고, 다른 잔이 유령 상태일 수 있음)
+            bool hasOtherGhosts = OrderManager.ghostMemory.any(
+                    (ghost) => ghost.orderNo == actualOrderNo
+            );
+
+            // 테이블 위에도 없고, 다른 유령도 없을 때 (즉, 그 주문의 마지막 잔이 사라졌을 때)
+            if (!isStillOnTable && !hasOtherGhosts) {
+              _serverService.sendToRole(
+                  "KDS",
+                  jsonEncode({
+                    "type": "PICKUP_COMPLETE",
+                    "orderNo": actualOrderNo,
+                    "menuName": mName, // 대표 메뉴명
+                  })
+              );
+              debugPrint("📢 [Auto-Pickup] $actualOrderNo번 모든 컵 제거 확인 -> KDS 신호 전송");
+            }
+
+            setState(() {
+              _pickupTimers.remove(actualOrderNo);
+            });
+          });
+        }
+        _videoLayerKey.currentState?.moveVideoToPosition(
+            existing.position,
+            sensorInputs.map((e) => e['pos'] as Offset).toList()
+        );
+      }
+    }
+
+    // 3. 신규 컵 추가
+    for (var nuevo in sensorInputs) {
+      var tof = nuevo['raw'] as TofObject;
+      tempList.add(DetectedObject(
+        id: tof.id,
+        orderNo: nuevo['label'],
+        position: nuevo['pos'],
+        zValue: tof.z,
+        diameter: CoordinateTransformer.getUiDiameter(tof.diameter),
+        uiWidth: CoordinateTransformer.getUiSize(tof.width, tof.height).width,
+        uiHeight: CoordinateTransformer.getUiSize(tof.width, tof.height).height,
+        color: nuevo['finalColor'],
+      ));
+    }
+
+    // 4. 모든 컵의 각도 미리 계산
+    final double sw = MediaQuery.of(context).size.width;
+    final double sh = MediaQuery.of(context).size.height;
+    List<DetectedObject> finalOptimizedList = [];
+
+    for (var obj in tempList) {
+      double angle = _getStaticSafeAngle(obj.position, obj.diameter, tempList, sw, sh);
+      finalOptimizedList.add(DetectedObject(
+        id: obj.id,
+        orderNo: obj.orderNo,
+        position: obj.position,
+        zValue: obj.zValue,
+        diameter: obj.diameter,
+        uiWidth: obj.uiWidth,
+        uiHeight: obj.uiHeight,
+        labelAngle: angle,
+        color: obj.color,
+      ));
+    }
+
+    if (mounted) {
+      setState(() {
+        objects = finalOptimizedList;
+        _updateGuidePositions();
+        _obstacleNotifier.value = objects.map((e) => e.position).toList();
+        _isHandDetected = false;
+      });
+    }
+  }
+
+  double _getStaticSafeAngle(Offset pos, double diameter, List<DetectedObject> others, double sw, double sh) {
+    double currentScanAngle = math.pi / 3.0; // 4시 방향 시작
+    final double textRadius = (diameter > 0 ? diameter / 2 : 150.0) / 2 + 18.0;
+
+    for (int i = 0; i < 15; i++) {
+      double checkX = pos.dx + textRadius * math.cos(currentScanAngle);
+      double checkY = pos.dy + textRadius * math.sin(currentScanAngle);
+
+      bool isSafe = (checkX > 40 && checkX < sw - 40 && checkY > 40 && checkY < sh - 40);
+
+      if (isSafe) {
+        for (var other in others) {
+          // 본인이 아닌 다른 컵과의 충돌 체크
+          if (other.position != pos && (Offset(checkX, checkY) - other.position).distance < (other.diameter / 4 + 40)) {
+            isSafe = false;
+            break;
+          }
+        }
       }
 
-      setState(() {
-        objects = nextObjects;
-        // 부모의 setState와 별개로 비디오 레이어에 알림 전송
-        _updateGuidePositions();
-      });
-      _obstacleNotifier.value = nextObjects.map((e) => e.position).toList();
-    });
+      if (isSafe) return currentScanAngle;
+      currentScanAngle += (math.pi / 24.0); // 빈 공간 찾기
+    }
+    return math.pi / 3.0; // 실패 시 기본 각도
   }
 
   void _sendTestCommandToPi() {
@@ -610,7 +754,8 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
     _serverService.sendToRole("TOF_SENSOR", jsonString);
 
     // 3. 로그 출력
-    _addLog("TX", "=== Frame: ${txPacket['frame_id']} (Count: ${dummyObjects.length}) ===");
+    //_addLog("TX",
+    //    "=== Frame: ${txPacket['frame_id']} (Count: ${dummyObjects.length}) ===");
 
     for (var obj in dummyObjects) {
       // 데이터 추출
@@ -620,10 +765,8 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
       double z = obj['z_value'];
       double d = obj['size']['diameter'];
 
-      _addLog(
-          "TX",
-          "  > [ID:$id] x:${x.toStringAsFixed(0)}, y:${y.toStringAsFixed(0)}, z:${z.toStringAsFixed(0)}, d:${d.toStringAsFixed(0)}"
-      );
+      //_addLog("TX",
+      //    "  > [ID:$id] x:${x.toStringAsFixed(0)}, y:${y.toStringAsFixed(0)}, z:${z.toStringAsFixed(0)}, d:${d.toStringAsFixed(0)}");
     }
   }
 
@@ -631,7 +774,6 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
   void dispose() {
     _handDetectionTimer?.cancel();
     _serverService.stopServer();
-    _clockTimer?.cancel();
     _adTimer?.cancel();
     _scrollController.dispose();
     _pickupTimers.forEach((key, timer) => timer.cancel());
@@ -652,328 +794,309 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
     // 화면 크기를 가져와서 반응형으로 처리
     return Scaffold(
       backgroundColor: Colors.black,
-      body: LayoutBuilder(
-          builder: (context, constraints) {
-            final screenWidth = constraints.maxWidth;
-            final screenHeight = constraints.maxHeight;
+      body: LayoutBuilder(builder: (context, constraints) {
+        final screenWidth = constraints.maxWidth;
+        final screenHeight = constraints.maxHeight;
 
-            return Stack(
-              fit: StackFit.expand,
-              children: [
-                const StaticBackground(),
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            const StaticBackground(),
 
-                // 동영상 (Ad)
-                FloatingVideoLayer(
-                  key: _videoLayerKey,
-                  screenWidth: screenWidth,
-                  screenHeight: screenHeight,
-                  obstacleNotifier: _obstacleNotifier,
-                  onLog: (msg) => debugPrint("[IPS_ANIM] $msg"),
+            //동영상 (Ad)
+            FloatingVideoLayer(
+              key: _videoLayerKey,
+              screenWidth: screenWidth,
+              screenHeight: screenHeight,
+              obstacleNotifier: _obstacleNotifier,
+              onLog: (msg) => debugPrint("[IPS_ANIM] $msg"),
+            ),
+
+            Positioned.fill(
+              child: RepaintBoundary(
+                child: CustomPaint(
+                  painter: PickupTablePainter(
+                    objects: objects,
+                    cupPalette: _idPalette,
+                    icons: _iconImages,
+                  ),
                 ),
+              ),
+            ),
 
-                ..._guidePositions.entries.map((entry) {
-                  Offset pos = entry.value;
-                  return AnimatedPositioned(
-                    key: ValueKey("guide_${entry.key}"),
-                    duration: const Duration(milliseconds: 500),
-                    curve: Curves.easeInOut,
-                    left: pos.dx - 90, // 지름 180의 절반
-                    top: pos.dy - 90,
-                    child: TweenAnimationBuilder<double>(
-                      tween: Tween(begin: 0.0, end: 1.0),
-                      duration: const Duration(seconds: 1),
-                      builder: (context, val, child) {
-                        return Opacity(
-                          opacity: val * 0.4, // 희미하게 표시
-                          child: CustomPaint(
-                            size: const Size(180, 180),
-                            painter: GuideCircle(), // guide_circle.dart의 클래스명 확인
-                          ),
-                        );
-                      },
-                    ),
-                  );
-                }).toList(),
-
-                // 3-2. 개별 컵 Glow 및 정보 표시
-                ...objects.map((obj) {
-                  // 리스트 안이 아니라 함수 블록 안이므로 여기서 변수 계산이 가능합니다.
-                  final double displaySize = obj.diameter > 0
-                      ? obj.diameter / 2
-                      : (obj.uiWidth + obj.uiHeight) / 2;
-
-                  return AnimatedPositioned(
-                    key: ValueKey("pos_${obj.id}"),
-                    duration: const Duration(milliseconds: 300),
-                    curve: Curves.easeOutQuart,
-                    // 정중앙 정렬 계산
-                    left: obj.position.dx - (displaySize / 2),
-                    top: obj.position.dy - (displaySize / 2),
-                    child: RepaintBoundary(
-                      child: IPSAnimatedWidget(
-                        key: ValueKey("anim_${obj.id}"),
-                        isExiting: false,
-                        duration: const Duration(milliseconds: 600),
-                        child: IndividualCupWidget(
-                          object: obj,
-                          allObjects: objects,
-                          screenWidth: screenWidth,
-                          screenHeight: screenHeight,
-                          cupColor: _getColorForId(obj.id),
-                        ),
-                      ),
-                    ),
-                  );
-                }),
-
-// 3-3. 퇴장 컵
-                ...exitingObjects.map((obj) {
-                  final double displaySize = obj.diameter > 0
-                      ? obj.diameter / 2
-                      : (obj.uiWidth + obj.uiHeight) / 2;
-
-                  return Positioned(
-                    key: ValueKey("exit_pos_${obj.id}"),
-                    left: obj.position.dx - (displaySize / 2),
-                    top: obj.position.dy - (displaySize / 2),
-                    child: RepaintBoundary(
-                      child: IPSAnimatedWidget(
-                        key: ValueKey("anim_${obj.id}_exit"),
-                        isExiting: true,
-                        duration: const Duration(milliseconds: 400),
-                        onExitFinished: () {
-                          setState(() {
-                            exitingObjects.removeWhere((e) => e.id == obj.id);
-                          });
+            RepaintBoundary(
+              child: Stack(
+                children: [
+                  ..._guidePositions.entries.map((entry) {
+                    Offset pos = entry.value;
+                    String label = _getGuideLabel(entry.key);
+                    return AnimatedPositioned(
+                      key: ValueKey("guide_${entry.key}"),
+                      duration: const Duration(milliseconds: 500),
+                      curve: Curves.easeInOut,
+                      left: pos.dx - 90,
+                      top: pos.dy - 90,
+                      child: TweenAnimationBuilder<double>(
+                        tween: Tween(begin: 0.0, end: 1.0),
+                        duration: const Duration(seconds: 1),
+                        builder: (context, val, child) {
+                          return Opacity(
+                            opacity: val * 0.5, // 이미지 가독성을 위해 0.5 정도 투명도 유지 (조절 가능)
+                            child: OrderGuideWidget(
+                              label: label,
+                              color: Colors.white, // 원하는 색상 지정 가능
+                              icons: _iconImages,
+                            ),
+                          );
                         },
-                        child: IndividualCupWidget(
-                          object: obj,
-                          allObjects: objects,
-                          screenWidth: screenWidth,
-                          screenHeight: screenHeight,
-                          cupColor: _getColorForId(obj.id),
-                        ),
                       ),
-                    ),
-                  );
-                }), // .ma
-                IgnorePointer( // 터치 이벤트를 방해하지 않도록 설정
-                  child: HandDetectionOverlay(visible: _isHandDetected),
-                ),
+                    );
+                  }).toList(),
+                ],
+              ),
+            ),
+            IgnorePointer(
+              // 터치 이벤트를 방해하지 않도록 설정
+              child: HandDetectionOverlay(visible: _isHandDetected),
+            ),
 
-                // (디버깅용) 우측 상단 포트 정보
-                Positioned(
-                  top: 40, right: 20,
-                  child: Text("Port: ${AppConstants.serverPort}", style: const TextStyle(color: Colors.white24)),
-                ),
+            // (디버깅용) 우측 상단 포트 정보
+            Positioned(
+              top: 40,
+              right: 20,
+              child: Text("Port: ${AppConstants.serverPort}",
+                  style: const TextStyle(color: Colors.white24)),
+            ),
 
-                if (_isConsoleOpen)
-                  Positioned(
-                    bottom: 80, right: 20,
-                    width: 600, height: 800,
-                    child: Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.9),
-                        border: Border.all(color: Colors.greenAccent, width: 1),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
+            if (_isConsoleOpen)
+              Positioned(
+                bottom: 80,
+                right: 20,
+                width: 600,
+                height: 800,
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.9),
+                    border: Border.all(color: Colors.greenAccent, width: 1),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      // 헤더: 제목 + 스위치 + 닫기
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          // 헤더: 제목 + 스위치 + 닫기
+                          // 제목
+                          const Text("NETWORK MONITOR",
+                              style: TextStyle(
+                                  color: Colors.greenAccent,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 12)),
+
+                          // 우측 컨트롤 패널 (토글 + 삭제 버튼)
                           Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
                             children: [
-                              // 제목
-                              const Text("NETWORK MONITOR", style: TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold, fontSize: 12)),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 8, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: Colors.white10,
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                                child: const RealTimeClock(),
+                              ),
+                              const SizedBox(width: 12),
+                              // 1. Raw Data 토글
+                              Text(_showRawData ? "RAW" : "EVENT",
+                                  style: TextStyle(
+                                      color: _showRawData
+                                          ? Colors.greenAccent
+                                          : Colors.white54,
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.bold)),
+                              Transform.scale(
+                                scale: 0.7,
+                                child: Switch(
+                                  value: _showRawData,
+                                  activeColor: Colors.greenAccent,
+                                  activeTrackColor:
+                                      Colors.greenAccent.withOpacity(0.3),
+                                  inactiveThumbColor: Colors.grey,
+                                  inactiveTrackColor: Colors.white10,
+                                  onChanged: (val) {
+                                    setState(() {
+                                      _showRawData = val;
+                                      //_addLog("SYS",
+                                      //    "Mode Changed: ${val ? 'Raw Data (All)' : 'Event Only (Diff > $_movementThreshold)'}");
+                                    });
+                                  },
+                                ),
+                              ),
 
-                              // 우측 컨트롤 패널 (토글 + 삭제 버튼)
-                              Row(
-                                children: [
-                                  Container(
-                                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                                    decoration: BoxDecoration(
-                                      color: Colors.white10,
-                                      borderRadius: BorderRadius.circular(4),
-                                    ),
-                                    child: Text(
-                                      _currentTimeStr,
-                                      style: const TextStyle(color: Colors.yellowAccent, fontSize: 12, fontFamily: 'Courier', fontWeight: FontWeight.bold),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 12),
-                                  // 1. Raw Data 토글
-                                  Text(
-                                      _showRawData ? "RAW" : "EVENT",
-                                      style: TextStyle(
-                                          color: _showRawData ? Colors.greenAccent : Colors.white54,
-                                          fontSize: 10,
-                                          fontWeight: FontWeight.bold
-                                      )
-                                  ),
-                                  Transform.scale(
-                                    scale: 0.7,
-                                    child: Switch(
-                                      value: _showRawData,
-                                      activeColor: Colors.greenAccent,
-                                      activeTrackColor: Colors.greenAccent.withOpacity(0.3),
-                                      inactiveThumbColor: Colors.grey,
-                                      inactiveTrackColor: Colors.white10,
-                                      onChanged: (val) {
-                                        setState(() {
-                                          _showRawData = val;
-                                          _addLog("SYS", "Mode Changed: ${val ? 'Raw Data (All)' : 'Event Only (Diff > $_movementThreshold)'}");
-                                        });
-                                      },
-                                    ),
-                                  ),
+                              const SizedBox(width: 8),
 
-                                  const SizedBox(width: 8),
-
-                                  // 2. 로그 삭제 버튼
-                                  TextButton.icon(
-                                    onPressed: () => setState(() => _consoleLogs.clear()),
-                                    icon: const Icon(Icons.delete_outline, color: Colors.white70, size: 18),
-                                    label: const Text("CLEAR", style: TextStyle(color: Colors.white70, fontSize: 12)),
-                                    style: TextButton.styleFrom(
-                                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                                      minimumSize: Size.zero,
-                                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                                    ),
-                                  ),
-                                ],
+                              // 2. 로그 삭제 버튼
+                              TextButton.icon(
+                                onPressed: () =>
+                                    setState(() => _consoleLogs.clear()),
+                                icon: const Icon(Icons.delete_outline,
+                                    color: Colors.white70, size: 18),
+                                label: const Text("CLEAR",
+                                    style: TextStyle(
+                                        color: Colors.white70, fontSize: 12)),
+                                style: TextButton.styleFrom(
+                                  padding:
+                                      const EdgeInsets.symmetric(horizontal: 8),
+                                  minimumSize: Size.zero,
+                                  tapTargetSize:
+                                      MaterialTapTargetSize.shrinkWrap,
+                                ),
                               ),
                             ],
                           ),
-                          const Divider(color: Colors.white24, height: 16),
-
-                          // 로그 리스트 영역
-                          Expanded(
-                            child: ListView.builder(
-                              controller: _scrollController,
-                              itemCount: _consoleLogs.length,
-                              physics: const ClampingScrollPhysics(),
-                              itemBuilder: (context, index) {
-                                final log = _consoleLogs[index];
-
-                                // 현재 아이템이 리스트의 마지막(가장 최신)인지 확인
-                                bool isLatestLine = index == _consoleLogs.length - 1;
-
-                                // [핵심] 이 로그가 현재 활성화된(가장 최신) 프레임에 속하는지 확인
-                                bool isFromCurrentFrame = log.frameId != null && log.frameId == _currentLatestFrameId;
-
-                                Color logColor;
-
-                                if (log.objectId != null && isFromCurrentFrame) {
-                                  // 1. 최신 프레임의 객체 데이터 -> ID별 고유 색상 적용
-                                  logColor = _getColorForId(log.objectId!);
-                                } else if (isLatestLine) {
-                                  // 2. 객체 데이터는 아니지만 가장 마지막 줄(헤더 등) -> 밝은 흰색
-                                  logColor = Colors.white;
-                                } else if (log.type == "SYS") {
-                                  // 3. 시스템 로그 -> 어두운 회색
-                                  logColor = Colors.white54;
-                                } else {
-                                  // 4. 지나간 과거의 프레임 데이터 또는 일반 로그 -> 희미한 색상
-                                  logColor = Colors.white54;
-                                }
-
-                                return Text(
-                                  // logText,
-                                  "[${log.timestamp}][${log.type}] ${log.message}",
-                                  style: TextStyle(
-                                    color: logColor,
-                                    fontWeight: isFromCurrentFrame ? FontWeight.bold : FontWeight.normal,
-                                    fontSize: 10,
-                                    fontFamily: 'Courier',
-                                  ),
-                                );
-                              },
-                            ),
-                          ),
-
-                          const SizedBox(height: 8),
-                          // 하단 버튼: 라즈베리 파이로 데이터 전송 테스트
-                          ElevatedButton.icon(
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: Colors.white12,
-                              foregroundColor: Colors.white,
-                              padding: const EdgeInsets.symmetric(vertical: 8),
-                            ),
-                            onPressed: _sendTestCommandToPi,
-                            icon: const Icon(Icons.send, size: 14, color: Colors.orangeAccent),
-                            label: const Text("SEND DATA (Test)", style: TextStyle(fontSize: 11)),
-                          )
                         ],
                       ),
-                    ),
-                  ),
+                      const Divider(color: Colors.white24, height: 16),
 
-                // Positioned(
-                //   bottom: 20, right: 80,
-                //   child: FloatingActionButton.small(
-                //     heroTag: "calibBtn",
-                //     backgroundColor: Colors.orangeAccent,
-                //     onPressed: () {
-                //       setState(() {
-                //         CoordinateTransformer.resetMatrix();
-                //         _serverService.sendMessage(jsonEncode({"event_type": "cal_restart"}));
-                //         _isCalibrating = true;
-                //       });
-                //     },
-                //     child: const Icon(Icons.ads_click, color: Colors.black),
-                //   ),
-                // ),
-                // 콘솔 토글 버튼 (우측 하단)
-                Positioned(
-                  bottom: 20, right: 20,
-                  child: FloatingActionButton.small(
-                    backgroundColor: _isConsoleOpen ? Colors.greenAccent : Colors.grey[800],
-                    onPressed: () => setState(() => _isConsoleOpen = !_isConsoleOpen),
-                    child: Icon(Icons.terminal, color: _isConsoleOpen ? Colors.black : Colors.white),
+                      // 로그 리스트 영역
+                      Expanded(
+                        child: ListView.builder(
+                          controller: _scrollController,
+                          itemCount: _consoleLogs.length,
+                          physics: const ClampingScrollPhysics(),
+                          itemBuilder: (context, index) {
+                            final log = _consoleLogs[index];
+
+                            // 현재 아이템이 리스트의 마지막(가장 최신)인지 확인
+                            bool isLatestLine =
+                                index == _consoleLogs.length - 1;
+
+                            // 이 로그가 현재 활성화된(가장 최신) 프레임에 속하는지 확인
+                            bool isFromCurrentFrame = log.frameId != null &&
+                                log.frameId == _currentLatestFrameId;
+
+                            Color logColor;
+
+                            if (log.objectId != null && isFromCurrentFrame) {
+                              // 1. 최신 프레임의 객체 데이터 -> ID별 고유 색상 적용
+                              logColor = _getColorForId(log.objectId!);
+                            } else if (isLatestLine) {
+                              // 2. 객체 데이터는 아니지만 가장 마지막 줄(헤더 등) -> 밝은 흰색
+                              logColor = Colors.white;
+                            } else if (log.type == "SYS") {
+                              // 3. 시스템 로그 -> 어두운 회색
+                              logColor = Colors.white54;
+                            } else {
+                              // 4. 지나간 과거의 프레임 데이터 또는 일반 로그 -> 희미한 색상
+                              logColor = Colors.white54;
+                            }
+
+                            return Text(
+                              // logText,
+                              "[${log.timestamp}][${log.type}] ${log.message}",
+                              style: TextStyle(
+                                color: logColor,
+                                fontWeight: isFromCurrentFrame
+                                    ? FontWeight.bold
+                                    : FontWeight.normal,
+                                fontSize: 10,
+                                fontFamily: 'Courier',
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+
+                      const SizedBox(height: 8),
+                      // 하단 버튼: 라즈베리 파이로 데이터 전송 테스트
+                      ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.white12,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                        ),
+                        onPressed: _sendTestCommandToPi,
+                        icon: const Icon(Icons.send,
+                            size: 14, color: Colors.orangeAccent),
+                        label: const Text("SEND DATA (Test)",
+                            style: TextStyle(fontSize: 11)),
+                      )
+                    ],
                   ),
                 ),
-                if (_isCalibrating)
-                  CalibrationScreen(
-                    currentRawPos: _latestRawForCalib,
-                    onCancel: () => setState(() => _isCalibrating = false),
-                    onComplete: (data) {
-                      setState(() => _isCalibrating = false);
-                      _processCalibration(data);
-                    },
-                  ),
-                // ...OrderManager.ghostMemory.map((ghost) {
-                //   return Positioned(
-                //     left: ghost.lastPos.dx - 45,
-                //     top: ghost.lastPos.dy - 45,
-                //     child: Opacity(
-                //       opacity: 0.2,
-                //       child: Container(
-                //         width: 90, height: 90,
-                //         decoration: BoxDecoration(
-                //           shape: BoxShape.circle,
-                //           // BorderStyle.dashed 에러 수정: solid로 변경
-                //           border: Border.all(color: Colors.white, width: 2, style: BorderStyle.solid),
-                //         ),
-                //         child: Center(
-                //           child: Text(ghost.orderNo,
-                //               style: const TextStyle(color: Colors.white, fontSize: 10)),
-                //         ),
-                //       ),
-                //     ),
-                //   );
-                // }).toList(),
-              ],
-            );
-          }
-      ),
+              ),
+
+            // 콘솔 토글 버튼 (우측 하단)
+            Positioned(
+              bottom: 20,
+              right: 20,
+              child: FloatingActionButton.small(
+                backgroundColor:
+                    _isConsoleOpen ? Colors.greenAccent : Colors.grey[800],
+                onPressed: () =>
+                    setState(() => _isConsoleOpen = !_isConsoleOpen),
+                child: Icon(Icons.terminal,
+                    color: _isConsoleOpen ? Colors.black : Colors.white),
+              ),
+            ),
+            if (_isCalibrating)
+              CalibrationScreen(
+                key: _calibKey,
+                currentRawPos: _latestRawForCalib,
+                currentRawZ: _lastFrameObjects.isNotEmpty ? _lastFrameObjects.first.z : 1000.0,
+                onValidationEntered: () {
+                  _serverService.sendToRole("KDS", jsonEncode({"type": "VALIDATION_MODE"}));
+                },
+                onEnterFineTune: () {
+                  _serverService.sendToRole("KDS", jsonEncode({"type": "ENTER_FINE_TUNE"}));
+                },
+                onCalibExit: () {
+                  _serverService.sendToRole("KDS", jsonEncode({"type": "CALIB_EXIT"}));
+                },
+
+                onCancel: () {
+                  _serverService.sendToRole("KDS", jsonEncode({"type": "CALIB_EXIT"}));
+                  setState(() => _isCalibrating = false);
+                },
+                onComplete: (data) {
+                  // exit 신호는 위 onCalibExit에서 이미 처리됨
+                  setState(() => _isCalibrating = false);
+                  _processCalibration(data);
+                },
+              ),
+            // ...OrderManager.ghostMemory.map((ghost) {
+            //   return Positioned(
+            //     left: ghost.lastPos.dx - 45,
+            //     top: ghost.lastPos.dy - 45,
+            //     child: Opacity(
+            //       opacity: 0.2,
+            //       child: Container(
+            //         width: 90, height: 90,
+            //         decoration: BoxDecoration(
+            //           shape: BoxShape.circle,
+            //           // BorderStyle.dashed 에러 수정: solid로 변경
+            //           border: Border.all(color: Colors.white, width: 2, style: BorderStyle.solid),
+            //         ),
+            //         child: Center(
+            //           child: Text(ghost.orderNo,
+            //               style: const TextStyle(color: Colors.white, fontSize: 10)),
+            //         ),
+            //       ),
+            //     ),
+            //   );
+            // }).toList(),
+          ],
+        );
+      }),
     );
   }
+
   final Map<String, Offset> _guidePositions = {};
   final Random _random = Random();
 
-// [추가] 빈 공간을 찾는 지능형 함수
+// 빈 공간을 찾는 함수
   Offset _findSafePosition(List<DetectedObject> currentCups) {
     int attempts = 0;
     const double minDistance = 250.0; // 컵과 가이드 사이의 최소 안전 거리
@@ -984,12 +1107,12 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
       Offset candidate = Offset(x, y);
 
       // 1. 현재 테이블 위 컵들과의 거리 체크
-      bool isFarFromCups = currentCups.every((cup) =>
-      (cup.position - candidate).distance > minDistance);
+      bool isFarFromCups = currentCups
+          .every((cup) => (cup.position - candidate).distance > minDistance);
 
       // 2. 다른 가이드 서클들과의 거리 체크
-      bool isFarFromGuides = _guidePositions.values.every((pos) =>
-      (pos - candidate).distance > minDistance);
+      bool isFarFromGuides = _guidePositions.values
+          .every((pos) => (pos - candidate).distance > minDistance);
 
       if (isFarFromCups && isFarFromGuides) return candidate;
       attempts++;
@@ -997,13 +1120,14 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
     return const Offset(960, 540); // 실패 시 중앙 반환
   }
 
-// [추가] 주문 대기열 상태와 가이드 좌표 싱크
+// 주문 대기열 상태와 가이드 좌표 싱크
   void _updateGuidePositions() {
     final pendingOrders = OrderManager.waitingQueue;
     final currentOrderIds = pendingOrders.map((o) => o['orderNo']!).toSet();
 
     // 1. 사라진 주문(매칭 완료된 주문)의 가이드 좌표 제거
-    _guidePositions.removeWhere((orderNo, _) => !currentOrderIds.contains(orderNo));
+    _guidePositions
+        .removeWhere((orderNo, _) => !currentOrderIds.contains(orderNo));
 
     // 2. 새로 들어온 주문에 대해서만 새 좌표 할당
     for (var order in pendingOrders) {
@@ -1016,7 +1140,7 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
 }
 
 // ==================== [Components: Layer 2 - Floating Video] ====================
-// 컵을 피해다니는 똑똑한 비디오 플레이어
+// 컵을 피해다니는 비디오 플레이어
 class FloatingVideoLayer extends StatefulWidget {
   final double screenWidth;
   final double screenHeight;
@@ -1036,10 +1160,8 @@ class FloatingVideoLayer extends StatefulWidget {
 }
 
 class FloatingVideoLayerState extends State<FloatingVideoLayer> {
-  //late VideoPlayerController _videoController;
   late final Player _player;
   late final VideoController _controller;
-  bool _isAdActuallyVisible = true;
 
   Offset _videoPos = Offset.zero;
   double _videoSize = 300.0;
@@ -1050,7 +1172,7 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
 
   bool _isFollowingPickup = false;
   Timer? _returnTimer;
-  Offset? _targetPickupPos;
+  bool _isVisible = true;
 
   static const Duration moveDuration = Duration(milliseconds: 2500);
   static const Duration sizeDuration = Duration(milliseconds: 1500);
@@ -1063,53 +1185,11 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
     _player = Player();
     _controller = VideoController(
       _player,
-      // configuration: const VideoControllerConfiguration(
-      // // [중요] 가능한 경우 하드웨어 서피스를 직접 사용하도록 유도
-      // // media_kit 버전에 따라 지원 여부가 다를 수 있으니 문서를 확인하세요.
-      // enableHardwareAcceleration: true,
     );
-    // WidgetsBinding.instance.addPostFrameCallback((_) async {
-    //   if (!mounted) return;
-    //
-    //   final playerPlatform = _player.platform;
-    //   if (playerPlatform is NativePlayer) {
-    //     try {
-    //       // [수정] crash를 유발하는 vo, gpu-api, opengl-pbo 설정을 제거합니다.
-    //       // 대신 하드웨어 디코딩 방식만 지정합니다.
-    //       await playerPlatform.setProperty('hwdec', 'mediacodec-copy'); // T982에서 가장 안정적
-    //
-    //       // 성능 최적화 (버퍼 및 스레드)
-    //       await playerPlatform.setProperty('vd-lavc-threads', '4');
-    //       await playerPlatform.setProperty('framedrop', 'vo');
-    //
-    //       debugPrint("🚀 [IPS_DEBUG] Stable 4K Profile Applied (Safety Mode)");
-    //     } catch (e) {
-    //       debugPrint("⚠️ HW 설정 실패: $e");
-    //     }
-    //   }
-    //
-    //   // [핵심] 보드가 리소스를 정리할 시간을 줍니다.
-    //   await Future.delayed(const Duration(seconds: 2));
-    //
-    //   if (!mounted) return;
-    //
-    //   await _player.open(
-    //       Media('asset://assets/videos/UHD_Landscape_265.mp4'),
-    //       play: false
-    //   );
-    //   await _player.setPlaylistMode(PlaylistMode.loop);
-    //
-    //   // [핵심] 비디오 위젯이 화면에 완전히 안착된 후 재생
-    //   await Future.delayed(const Duration(milliseconds: 500));
-    //   if (mounted) {
-    //     await _player.play();
-    //     findNextSafePosition();
-    //   }
-    // });
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted) return;
 
-      // [핵심 1] 1초 대기 (T982 보드에서 네이티브 Surface가 안정화되는 최소 시간)
+      // 1초 대기 (T982 보드에서 네이티브 Surface가 안정화되는 최소 시간)
       await Future.delayed(const Duration(milliseconds: 1000));
 
       final playerPlatform = _player.platform;
@@ -1127,8 +1207,9 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
         }
       }
 
-      // [핵심 4] 비디오를 열 때 '재생'은 하지 않고 준비만 시킴
-      await _player.open(Media('asset://assets/videos/video_stbs2.mp4'), play: false);
+      // 비디오를 열 때 '재생'은 하지 않고 준비만 시킴
+      await _player.open(Media('asset://assets/videos/video_stbs2.mp4'),
+          play: false);
       await _player.setPlaylistMode(PlaylistMode.loop);
       await _player.setVolume(0);
 
@@ -1195,8 +1276,9 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
     );
   }
 
-  // 컵이 사라진 위치로 이동 (Shrink -> Teleport -> Grow 시퀀스)
-  Future<void> moveVideoToPosition(Offset pickupPos, List<Offset> obstacles) async {
+  // 컵이 사라진 위치로 이동
+  Future<void> moveVideoToPosition(
+      Offset pickupPos, List<Offset> obstacles) async {
     if (!mounted || _isFollowingPickup) return;
 
     _isFollowingPickup = true; // 고정 모드 활성화
@@ -1207,8 +1289,10 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
 
     for (int i = 0; i < 5; i++) {
       double angle = i * (2 * math.pi / 5);
-      Offset offsetCandidate = pickupPos + Offset(math.cos(angle) * 80, math.sin(angle) * 80); // 80px 반경 조사
-      double candidateSize = _calculateMaxAvailableSize(offsetCandidate, obstacles);
+      Offset offsetCandidate = pickupPos +
+          Offset(math.cos(angle) * 80, math.sin(angle) * 80); // 80px 반경 조사
+      double candidateSize =
+          _calculateMaxAvailableSize(offsetCandidate, obstacles);
 
       if (candidateSize > bestPickupSize) {
         bestPickupSize = candidateSize;
@@ -1217,9 +1301,13 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
     }
 
     double rawTargetSize = bestPickupSize.clamp(minVideoSize, maxVideoSize);
-    Offset finalTargetCenter = _getStrictSafeCenter(optimizedPickupPos, rawTargetSize);
-    double finalTargetSize = _calculateMaxAvailableSize(finalTargetCenter, obstacles).clamp(minVideoSize, maxVideoSize);
-    Offset finalLeftTopPos = finalTargetCenter - Offset(finalTargetSize / 2, finalTargetSize / 2);
+    Offset finalTargetCenter =
+        _getStrictSafeCenter(optimizedPickupPos, rawTargetSize);
+    double finalTargetSize =
+        _calculateMaxAvailableSize(finalTargetCenter, obstacles)
+            .clamp(minVideoSize, maxVideoSize);
+    Offset finalLeftTopPos =
+        finalTargetCenter - Offset(finalTargetSize / 2, finalTargetSize / 2);
 
     setState(() {
       _videoPos = finalLeftTopPos;
@@ -1254,18 +1342,19 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
     });
   }
 
-  // 특정 위치에서 가능한 최대 크기(75% 룰) 계산
+  // 특정 위치에서 가능한 최대 크기 계산
   double _calculateMaxAvailableSize(Offset center, List<Offset> obstacles) {
     // 1. 벽까지의 거리
     double distToLeft = center.dx;
     double distToRight = widget.screenWidth - center.dx;
     double distToTop = center.dy;
     double distToBottom = widget.screenHeight - center.dy;
-    double minToWall = [distToLeft, distToRight, distToTop, distToBottom].reduce(min);
+    double minToWall =
+        [distToLeft, distToRight, distToTop, distToBottom].reduce(min);
 
     // 2. 장애물까지의 거리
     double minToObstacle = double.infinity;
-    const double obstacleRadius = 100.0;
+    const double obstacleRadius = 70.0;
 
     if (obstacles.isNotEmpty) {
       for (var obstacle in obstacles) {
@@ -1276,7 +1365,7 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
 
     // 3. 75% 적용
     double maxRadius = min(minToWall, minToObstacle);
-    double calculatedSize = (maxRadius * 2) * 0.75;
+    double calculatedSize = (maxRadius * 2) * 0.9;
 
     return calculatedSize;
   }
@@ -1287,9 +1376,9 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
     final List<Offset> obstacles = widget.obstacleNotifier.value;
     // 테이블 위에 아무것도 없으면? -> 정중앙
     if (obstacles.isEmpty) {
+      _updateVisibility(true);
       Offset centerScreen = Offset(widget.screenWidth / 2, widget.screenHeight / 2);
       double finalSize = _calculateMaxAvailableSize(centerScreen, []).clamp(minVideoSize, maxVideoSize);
-
       setState(() {
         _videoPos = centerScreen - Offset(finalSize / 2, finalSize / 2);
         _videoSize = finalSize;
@@ -1299,7 +1388,7 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
 
     Offset bestCenter = Offset.zero;
     double bestSize = 0;
-    const int samplingCount = 20; // 20군데를 찔러보고 가장 좋은 곳 선택
+    const int samplingCount = 50; // 20군데를 찔러보고 가장 좋은 곳 선택
 
     for (int i = 0; i < samplingCount; i++) {
       // 랜덤 후보지 생성
@@ -1308,9 +1397,10 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
       Offset candidateCenter = Offset(randX, randY);
 
       // 해당 위치에서 가능한 최대 크기 계산
-      double currentSize = _calculateMaxAvailableSize(candidateCenter, obstacles);
+      double currentSize =
+          _calculateMaxAvailableSize(candidateCenter, obstacles);
 
-      // [핵심] 기존에 찾은 곳보다 더 큰 공간이면 업데이트
+      // 기존에 찾은 곳보다 더 큰 공간이면 업데이트
       if (currentSize > bestSize) {
         bestSize = currentSize;
         bestCenter = candidateCenter;
@@ -1318,13 +1408,28 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
     }
 
     // 최종 선택된 최적지로 이동
-    if (bestSize >= minVideoSize) {
+    if (bestSize < minVideoSize) {
+      _updateVisibility(false); // 공간 없으면 숨김
+    } else {
+      _updateVisibility(true);  // 공간 있으면 표시
       double finalSize = bestSize.clamp(minVideoSize, maxVideoSize);
       setState(() {
         _videoSize = finalSize;
-        // 이전 답변에서 적용한 안전 좌표(StrictSafe)를 사용하여 이동
         _videoPos = _getStrictSafeCenter(bestCenter, finalSize) - Offset(finalSize / 2, finalSize / 2);
       });
+    }
+  }
+
+  void _updateVisibility(bool visible) {
+    if (_isVisible == visible) return;
+    setState(() {
+      _isVisible = visible;
+    });
+    // 리소스 절약을 위해 숨겨질 때 정지, 보일 때 재생
+    if (visible) {
+      _player.play();
+    } else {
+      _player.pause();
     }
   }
 
@@ -1351,22 +1456,18 @@ class FloatingVideoLayerState extends State<FloatingVideoLayer> {
       curve: animationCurve,
       left: _videoPos.dx,
       top: _videoPos.dy,
-      child: RepaintBoundary(
-        child: AnimatedContainer(
-          duration: sizeDuration,
-          curve: animationCurve, // 크기 변할 때 효과
-          width: _videoSize,
-          height: _videoSize,
-          decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 20)]
-          ),
-          child: ClipOval(
-            child: Video(
-              controller: _controller,
-              fit: BoxFit.cover,
-              controls: NoVideoControls,
-            )
+      child: AnimatedOpacity( // 투명도 애니메이션 추가
+        duration: const Duration(milliseconds: 500),
+        opacity: _isVisible ? 1.0 : 0.0,
+        child: RepaintBoundary( // 독립적 렌더링 레이어 보장
+          child: AnimatedContainer(
+            duration: sizeDuration,
+            curve: animationCurve,
+            width: _videoSize,
+            height: _videoSize,
+            decoration: const BoxDecoration(shape: BoxShape.circle, color: Colors.black),
+            clipBehavior: Clip.hardEdge,
+            child: Video(controller: _controller, fit: BoxFit.cover, controls: NoVideoControls),
           ),
         ),
       ),
@@ -1385,11 +1486,11 @@ class GroupConnectorPainter extends CustomPainter {
     if (objects.length < 2) return;
 
     final paint = Paint()
-      ..color = Colors.cyanAccent.withOpacity(0.15) // 그룹 색상 (사이버틱한 느낌)
+      ..color = Colors.cyanAccent.withOpacity(0.15) // 그룹 색상
       ..style = PaintingStyle.stroke
       ..strokeWidth = 60.0
-      ..strokeCap = StrokeCap.round
-      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 30); // 빛 번짐 효과
+      ..strokeCap = StrokeCap.round;
+      // ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 30); // 빛 번짐 효과
 
     final path = Path();
     for (int i = 0; i < objects.length; i++) {
@@ -1399,8 +1500,8 @@ class GroupConnectorPainter extends CustomPainter {
         path.quadraticBezierTo(
             (objects[i].position.dx + objects[j].position.dx) / 2,
             (objects[i].position.dy + objects[j].position.dy) / 2 + 40,
-            objects[j].position.dx, objects[j].position.dy
-        );
+            objects[j].position.dx,
+            objects[j].position.dy);
       }
     }
     canvas.drawPath(path, paint);
@@ -1410,17 +1511,17 @@ class GroupConnectorPainter extends CustomPainter {
   bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
 }
 
-// [수정 3] Grid System Component (새로 추가됨)
+// Grid System Component (새로 추가됨)
 class GridPatternPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final Paint linePaint = Paint()
-      ..color = Colors.white.withOpacity(0.1) // 아주 연한 흰색
+      ..color = Colors.white.withOpacity(0.1)
       ..strokeWidth = 1.0
       ..style = PaintingStyle.stroke;
 
     final Paint nodePaint = Paint()
-      ..color = Colors.white.withOpacity(0.3) // 교차점은 조금 더 밝게
+      ..color = Colors.white.withOpacity(0.3)
       ..style = PaintingStyle.fill;
 
     const double step = 100.0; // 100픽셀 단위
@@ -1441,16 +1542,13 @@ class GridPatternPainter extends CustomPainter {
         // 교차점에 작은 원
         canvas.drawCircle(Offset(x, y), 2.0, nodePaint);
 
-        // (선택 사항) 좌표 텍스트 표시 - 너무 복잡해질 수 있어 주석 처리
-
         TextSpan span = TextSpan(
             style: TextStyle(color: Colors.white.withOpacity(0.2), fontSize: 8),
-            text: "(${x.toInt()},${y.toInt()})"
-        );
-        TextPainter tp = TextPainter(text: span, textDirection: TextDirection.ltr);
+            text: "(${x.toInt()},${y.toInt()})");
+        TextPainter tp =
+            TextPainter(text: span, textDirection: TextDirection.ltr);
         tp.layout();
         tp.paint(canvas, Offset(x + 4, y + 4));
-
       }
     }
   }
@@ -1465,14 +1563,16 @@ class GridPatternPainter extends CustomPainter {
     // 수직선인 경우
     if (p1.dx == p2.dx) {
       while (startY < p2.dy) {
-        canvas.drawLine(Offset(startX, startY), Offset(startX, startY + dashWidth), paint);
+        canvas.drawLine(
+            Offset(startX, startY), Offset(startX, startY + dashWidth), paint);
         startY += dashWidth + dashSpace;
       }
     }
     // 수평선인 경우
     else {
       while (startX < p2.dx) {
-        canvas.drawLine(Offset(startX, startY), Offset(startX + dashWidth, startY), paint);
+        canvas.drawLine(
+            Offset(startX, startY), Offset(startX + dashWidth, startY), paint);
         startX += dashWidth + dashSpace;
       }
     }
@@ -1480,163 +1580,6 @@ class GridPatternPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
-}
-
-class IndividualCupWidget extends StatelessWidget {
-  final DetectedObject object;
-  final List<DetectedObject> allObjects;
-  final double screenWidth;
-  final double screenHeight;
-  final Color cupColor;
-  const IndividualCupWidget({
-    super.key,
-    required this.object,
-    required this.allObjects,
-    required this.screenWidth,
-    required this.screenHeight,
-    required this.cupColor,
-  });
-
-  // 주문번호 충돌 시 이동
-  double _calculateSafeAngle() {
-    const double baseAngle = math.pi / 3.0; // 기본 4시 방향
-    double currentScanAngle = baseAngle;
-
-    final double myRadius = (object.diameter > 0 ? object.diameter : 150.0) / 4;
-    final double textRadius = myRadius + 18.0;
-
-    // 1. [정밀 튜닝] "NO.101"은 약 25~30도면 충분합니다. (pi / 6)
-    // 너무 넓게 잡으면 벽 근처에서 과하게 반응합니다.
-    const double textAngularWidth = math.pi / 6.0;
-
-    bool isPerfectlySafe = false;
-    int attempts = 0;
-    const int maxAttempts = 30; // 보폭이 좁아졌으므로 시도 횟수를 늘립니다.
-
-    // 텍스트가 잘리지 않을 최소한의 여백 (30~35 정도가 적당)
-    const double wallPadding = 35.0;
-
-    while (!isPerfectlySafe && attempts < maxAttempts) {
-      isPerfectlySafe = true;
-
-      // 시작점, 중간점, 끝점 3포인트 검사
-      List<double> anglesToCheck = [
-        currentScanAngle,
-        currentScanAngle - (textAngularWidth / 2),
-        currentScanAngle - textAngularWidth,
-      ];
-
-      for (double angle in anglesToCheck) {
-        double checkX = object.position.dx + textRadius * math.cos(angle);
-        double checkY = object.position.dy + textRadius * math.sin(angle);
-
-        if (checkX < wallPadding ||
-            checkX > screenWidth - wallPadding ||
-            checkY < wallPadding ||
-            checkY > screenHeight - wallPadding) {
-          isPerfectlySafe = false;
-          break;
-        }
-      }
-
-      // 2. 컵 충돌 체크는 동일하게 유지
-      if (isPerfectlySafe) {
-        double centerX = object.position.dx + textRadius * math.cos(currentScanAngle - textAngularWidth / 2);
-        double centerY = object.position.dy + textRadius * math.sin(currentScanAngle - textAngularWidth / 2);
-        if (allObjects.any((other) => other.id != object.id &&
-            (Offset(centerX, centerY) - other.position).distance < (other.diameter/4 + 50))) {
-          isPerfectlySafe = false;
-        }
-      }
-
-      if (!isPerfectlySafe) {
-        // 3. [핵심] 도망가는 보폭을 pi/36 (5도)로 매우 촘촘하게 수정
-        // 이전 pi/12 (15도)는 너무 성큼성큼 움직여서 금방 10시 방향까지 간 것입니다.
-        currentScanAngle += (math.pi / 36.0);
-        attempts++;
-      }
-    }
-    return currentScanAngle;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final double finalSize = object.diameter > 0
-        ? object.diameter / 2
-        : (object.uiWidth + object.uiHeight) / 2;
-
-    final double textRadius = (finalSize / 2) + 12;
-
-    final double safeAngle = _calculateSafeAngle();
-
-    final String displayText = object.orderNo == "UNKNOWN"
-        ? "UNKNOWN"
-        : "NO.${object.orderNo}";
-
-    return SizedBox(
-      width: finalSize,
-      height: finalSize,
-      child: Stack(
-        alignment: Alignment.center,
-        clipBehavior: Clip.none,
-        children: [
-          // 그림자/효과 모두 제거하고 깔끔한 원형 테두리만 남김
-          Container(
-            width: finalSize,
-            height: finalSize,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: Colors.transparent,
-              border: Border.all(
-                color: cupColor,
-                width: 3, // 테두리 두께 살짝 조정
-              ),
-            ),
-          ),
-
-          // 2. 우측 하단 주문 번호 라벨
-          TweenAnimationBuilder<double>(
-            key: ValueKey("text_anim_${object.id}"),
-            duration: const Duration(milliseconds: 700),
-            curve: Curves.easeOutQuart,
-            tween: Tween<double>(end: safeAngle),
-            builder: (context, animatedAngle, child) {
-              return CustomPaint(
-                size: Size(finalSize, finalSize),
-                painter: ArcTextPainter(
-                  text: displayText,
-                  radius: textRadius,
-                  startAngle: animatedAngle,
-                  style: TextStyle(
-                    color: cupColor,
-                    fontSize: 15,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 1.5,
-                  ),
-                ),
-              );
-            },
-          ),
-
-          // 중앙 텍스트 정보
-          if (object.uiWidth > 100)
-            Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text("${object.position.dx.toInt()},${object.position.dy.toInt()}",
-                    style: const TextStyle(color: Colors.white54, fontSize: 10)),
-                Text("w:${object.uiWidth.toInt()} h:${object.uiHeight.toInt()}",
-                    style: const TextStyle(color: Colors.white70, fontSize: 9)),
-                Text(
-                    "D: ${finalSize.toInt()}${object.diameter == 0 ? '(w,h)' : '(d)'}",
-                    style: const TextStyle(color: Colors.white70, fontSize: 9)
-                )
-              ],
-            ),
-        ],
-      ),
-    );
-  }
 }
 
 class StaticBackground extends StatelessWidget {
@@ -1673,5 +1616,164 @@ class StaticBackground extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+class RealTimeClock extends StatefulWidget {
+  const RealTimeClock({super.key});
+  @override
+  State<RealTimeClock> createState() => _RealTimeClockState();
+}
+
+class _RealTimeClockState extends State<RealTimeClock> {
+  late Timer _timer;
+  String _timeStr = "";
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      final now = DateTime.now();
+      setState(() {
+        _timeStr =
+            "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}";
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(_timeStr,
+        style: const TextStyle(
+            color: Colors.yellowAccent,
+            fontSize: 12,
+            fontFamily: 'Courier',
+            fontWeight: FontWeight.bold));
+  }
+}
+
+class PickupTablePainter extends CustomPainter {
+  final List<DetectedObject> objects;
+  final List<Color> cupPalette;
+  final Map<String, ui.Image> icons;
+
+  PickupTablePainter({required this.objects, required this.cupPalette, required this.icons});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    for (var obj in objects) {
+      final color = obj.color;
+
+      // 1. 컵 원 그리기용 Paint 설정
+      final circlePaint = Paint()
+        ..color = color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 3.0;
+
+      final double radius = (obj.diameter > 0 ? obj.diameter / 2 : 100.0) / 2;
+
+      // 2. 컵 원형 테두리 그리기
+      canvas.drawCircle(obj.position, radius, circlePaint);
+
+      // 3. 주문 번호(이름) 텍스트 그리기
+      _drawTextLabel(canvas, obj, color, radius);
+    }
+  }
+
+  void _drawTextLabel(Canvas canvas, DetectedObject obj, Color color, double radius) {
+    final String text = obj.orderNo;
+    final double textRadius = radius + 15.0;
+
+    // 1. 그릴 요소들을 미리 준비 (이미지인지 텍스트인지 구분)
+    final List<Map<String, dynamic>> elements = [];
+    double totalWidth = 0;
+
+    for (var char in text.characters) {
+      ui.Image? icon = icons[char]; // ✨ 미리 로드된 PNG 아이콘 확인
+
+      if (icon != null) {
+        // [아이콘인 경우]
+        const double iconSize = 24.0;
+        elements.add({
+          'type': 'icon',
+          'data': icon,
+          'width': iconSize,
+        });
+        totalWidth += iconSize;
+      } else {
+        // [일반 글자/구분선인 경우]
+        Color charColor = (char == '|') ? Colors.white38 : color;
+        final tp = TextPainter(
+          text: TextSpan(
+            text: char,
+            style: TextStyle(
+              color: charColor,
+              fontSize: 20,
+              fontFamily: 'CenturyGothic',
+              fontWeight: FontWeight.w400,
+              letterSpacing: 1.2,
+              fontFamilyFallback: ['Noto Color Emoji'],
+            ),
+          ),
+          textDirection: TextDirection.ltr,
+        )..layout();
+
+        elements.add({
+          'type': 'text',
+          'data': tp,
+          'width': tp.width,
+        });
+        totalWidth += tp.width;
+      }
+    }
+
+    // 2. 중앙 정렬을 위한 각도 계산
+    double totalAngle = totalWidth / textRadius;
+    double currentAngle = obj.labelAngle + (totalAngle / 2);
+
+    // 3. 루프를 돌며 실제 그리기
+    for (var element in elements) {
+      final double elementWidth = element['width'] as double;
+      final double charAngle = elementWidth / textRadius;
+      final double drawAngle = currentAngle - (charAngle / 2);
+
+      final double x = obj.position.dx + textRadius * math.cos(drawAngle);
+      final double y = obj.position.dy + textRadius * math.sin(drawAngle);
+
+      canvas.save();
+      canvas.translate(x, y);
+      canvas.rotate(drawAngle - math.pi / 2);
+
+      if (element['type'] == 'icon') {
+        // ✨ PNG 아이콘 그리기
+        final ui.Image icon = element['data'] as ui.Image;
+        const double iconSize = 24.0;
+        canvas.drawImageRect(
+          icon,
+          Rect.fromLTWH(0, 0, icon.width.toDouble(), icon.height.toDouble()),
+          Rect.fromLTWH(-iconSize / 2, -iconSize / 2, iconSize, iconSize),
+          Paint()..filterQuality = ui.FilterQuality.high,
+        );
+      } else {
+        // ✨ 텍스트(닉네임/구분선) 그리기
+        final TextPainter tp = element['data'] as TextPainter;
+        tp.paint(canvas, Offset(-tp.width / 2, -tp.height / 2));
+      }
+
+      canvas.restore();
+      currentAngle -= charAngle;
+    }
+  }
+
+  @override
+  bool shouldRepaint(PickupTablePainter oldDelegate) {
+    // 객체 리스트가 바뀌었을 때만 다시 그리도록 최적화
+    return oldDelegate.objects != objects;
   }
 }

@@ -1,11 +1,13 @@
-  // lib/services/homography_solver.dart
-  import 'package:ml_linalg/matrix.dart';
-  import 'package:ml_linalg/dtype.dart';
-  import 'package:ml_linalg/vector.dart';
-  import 'dart:math';
+import 'dart:ui';
+import 'package:ml_linalg/matrix.dart';
+import 'package:ml_linalg/dtype.dart';
+import 'package:ml_linalg/vector.dart';
+import 'dart:math';
+
+import 'coordinate_transformer.dart';
 
   class HomographySolver {
-    static Matrix solve(List<Point<double>> src, List<Point<double>> dst) {
+    static Matrix solve(List<Point<double>> src, List<double> zs, List<Point<double>> dst) {
       if (src.length < 4) throw Exception("최소 4개 이상의 점이 필요합니다.");
 
       // [핵심] 수치 안정화를 위한 스케일링 (0~1 범위로 압축)
@@ -16,9 +18,10 @@
       List<double> bList = [];
 
       for (int i = 0; i < src.length; i++) {
-        // 숫자를 작게 만들어 연산 정밀도 확보
-        double x = src[i].x * sS;
-        double y = src[i].y * sS;
+        Offset ground = CoordinateTransformer.getParallaxCorrectedOffset(src[i].x, src[i].y, zs[i]);
+
+        double x = ground.dx * sS;
+        double y = ground.dy * sS;
         double u = dst[i].x * sD;
         double v = dst[i].y * sD;
 
@@ -31,12 +34,18 @@
       final A = Matrix.fromList(aList, dtype: DType.float64);
       final B = Matrix.fromColumns([Vector.fromList(bList, dtype: DType.float64)], dtype: DType.float64);
 
-      // 정규 방정식: h = (A^T * A)^-1 * A^T * B
       final At = A.transpose();
       final AtA = At * A;
 
-      // 역행렬 계산 (숫자가 작아져서 이제 매우 안정적입니다)
-      final h = AtA.inverse() * At * B;
+      // 역행렬이 존재하지 않을 경우를 대비한 방어 로직
+      Matrix h;
+      try {
+        h = AtA.inverse() * At * B;
+      } catch (e) {
+        // 역행렬 실패 시 단위행렬 반환하여 크래시 방지
+        return Matrix.fromList([[1,0,0],[0,1,0],[0,0,1]]);
+      }
+
       final fH = h.getColumn(0);
 
       // [복원] 정규화했던 수치를 다시 UI 픽셀 단위로 복구
