@@ -1,136 +1,118 @@
-import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:ui';
 import 'package:flutter/material.dart';
-
 import '../config/app_constants.dart';
 
 class CoordinateTransformer {
-  // 1. 호모그래피 행렬 저장 변수 (초기값은 변환이 없는 '단위 행렬')
-  static List<double> _h = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  // 🌟 [변경] 기존 _h(9개) 대신 대표님 방식의 12개 계수 저장 (ax1~6, ay1~6)
+  static List<double> _coeffs = List.filled(12, 0.0);
   static List<Offset> _residuals = List.generate(9, (_) => Offset.zero);
-  static const double focalLength = 360.0;
+
+  //static const double fixedCupHeight = 110.0;
   static const double opticalCenterX = 320.0;
   static const double opticalCenterY = 240.0;
-  static const double k1 = 0;
+
+  static const double _fx = 290.0;
+  static const double _fy = 320.0;
+
+  static double uiPostGain = 1.0;
+
   static void updateResiduals(List<Offset> newResiduals) {
     _residuals = newResiduals;
   }
-  // 2. 행렬 업데이트 함수 (Calibration 완료 후 호출됨)
-  static void setHomographyMatrix(List<double> matrix) {
-    _h = matrix;
-    print("🎯 CoordinateTransformer: 새로운 호모그래피 행렬이 적용되었습니다.");
+
+  // 🌟 [변경] 행렬 세터 대신 다항식 계수 세터로 교체
+  static void setPolynomialCoefficients(List<double> coeffs) {
+    _coeffs = coeffs;
+    debugPrint("🎯 [Transformer] 2차 다항식 계수(12개) 적용 완료");
   }
 
   static void resetMatrix() {
-    _h = [1, 0, 0, 0, 1, 0, 0, 0, 1];
-    debugPrint("🔄 [Transformer] 행렬이 초기화되었습니다. (Collapse 현상 방지)");
+    _coeffs = List.filled(12, 0.0);
+    _residuals = List.generate(9, (_) => Offset.zero);
   }
 
-  static Offset getParallaxCorrectedOffset(double rawX, double rawY, double zRaw, {bool showLog = false, bool applyDistortion = true}) {
-    // ---------------------------------------------------------
-    // 1. 방사 왜곡 보정 (Radial Undistortion) - 사이 구간 밀림 해결
-    // ---------------------------------------------------------
-    // 중심으로부터의 거리를 정규화(Normalized)하여 왜곡률 계산
-    double undistortedX = rawX;
-    double undistortedY = rawY;
+  static Offset getFixedParallax(double rawX, double rawY, double zRaw) {
+    // 1. 좌표계를 광원(테이블 센터) 기준으로 변환 (Shift to Origin)
+    double dx = rawX - opticalCenterX;
+    double dy = rawY - opticalCenterY;
 
-    if (applyDistortion) {
-      double nx = (rawX - opticalCenterX) / focalLength;
-      double ny = (rawY - opticalCenterY) / focalLength;
-      double rSq = nx * nx + ny * ny;
-      double distortionFactor = 1.0 + k1 * rSq;
+    double projectionFactor = math.sqrt(1 + math.pow(dx / _fx, 2) + math.pow(dy / _fy, 2));
 
-      undistortedX = opticalCenterX + (rawX - opticalCenterX) * distortionFactor;
-      undistortedY = opticalCenterY + (rawY - opticalCenterY) * distortionFactor;
-    }
+    // 이것이 렌즈에서 물체 윗면까지의 실제 "수직 거리"입니다.
+    double zVert = zRaw / projectionFactor;
+    //debugPrint("🔍 [Z-DEBUG] RawZ: ${zRaw.toStringAsFixed(1)} -> VertZ: ${zVert.toStringAsFixed(1)} (Factor: ${projectionFactor.toStringAsFixed(3)})");
+    // 2. 비례식 계산 (H: 센서높이, h: 컵높이)
+    double H = AppConstants.totalSensorHeight;
+    double ratio = (zVert / H).clamp(0.0, 1.0);
 
-    // ---------------------------------------------------------
-    // 2. 시차 보정 (currentFloor는 1000.0 고정)
-    // ---------------------------------------------------------
-    double dx = undistortedX - opticalCenterX;
-    double dy = undistortedY - opticalCenterY;
-    double r = math.sqrt(dx * dx + dy * dy);
-
-    double theta = math.atan2(r, focalLength);
-    double zVert = zRaw * math.cos(theta);
-    double currentFloor = AppConstants.totalSensorHeight; // 실측 표준값 고정
-
-    double correctionFactor = (currentFloor > 0) ? (zVert / currentFloor) : 1.0;
-
-    return Offset(
-      opticalCenterX + dx * correctionFactor,
-      opticalCenterY + dy * correctionFactor,
-    );
+    return Offset(opticalCenterX + dx * ratio, opticalCenterY + dy * ratio);
   }
 
-  //static bool _isFirstHeightSet = false;
-  // static void updateFloorHeight(double rawZ) {
-  //   // 센서가 측정한 광학적 바닥 높이를 그대로 신뢰합니다.
-  //   double currentHeight = AppConstants.totalSensorHeight;
-  //   double diff = (rawZ - currentHeight).abs();
-  //
-  //   // 첫 실행이거나, 변화량이 5mm 이상일 때만 업데이트
-  //   if (!_isFirstHeightSet || diff >= 5.0) {
-  //     AppConstants.totalSensorHeight = rawZ - 120;
-  //     _isFirstHeightSet = true;
-  //
-  //     debugPrint(
-  //         "📢 [Sensor Sync] 바닥 높이(base_z) 확정: ${rawZ.toStringAsFixed(1)}mm");
-  //     if (diff >= 5.0 && _isFirstHeightSet) {
-  //       debugPrint("⚠️ 환경 변화 감지 (차이: ${diff.toStringAsFixed(1)}mm)");
-  //     }
-  //   }
-  // }
-  /// 1000으로 높이 고정
-  static void updateFloorHeight(double rawZ) {
-    // 실측값 고정 모드이므로 센서 데이터(rawZ)를 무시합니다.
-    // 필요 시 로그만 남겨 실제 센서 측정값과 실측값의 차이만 모니터링합니다.
-    if (AppConstants.isDebug) {
-      double diff = (rawZ - AppConstants.totalSensorHeight).abs();
-      if (diff > 10.0) {
-        // debugPrint("ℹ️ [Sensor Sync] 고정값(1000) 대비 센서 실측치 차이: ${diff.toStringAsFixed(1)}mm");
-      }
-    }
+  static double getCorrectedZ(double rawX, double rawY, double zRaw) {
+    double dx = rawX - opticalCenterX;
+    double dy = rawY - opticalCenterY;
+    double projectionFactor = math.sqrt(1 + math.pow(dx / _fx, 2) + math.pow(dy / _fy, 2));
+    return zRaw / projectionFactor;
   }
 
-  static Offset transform(double rawX, double rawY, double zValue, {bool showLog = false}) {
-    // 1. 센서 평면의 왜곡과 시차를 먼저 제거하여 '순수한 바닥 좌표'를 얻음
-    Offset groundPoint = getParallaxCorrectedOffset(rawX, rawY, zValue, showLog: showLog);
+  /// [2단계] 최종 변환 함수 (대표님 제안: 2차 다항식 엔진)
+  static Offset transform(double rawX, double rawY, double zValue) {
+    Offset g = getFixedParallax(rawX, rawY, zValue);
 
-    // 2. 호모그래피 변환
-    double den = _h[6] * groundPoint.dx + _h[7] * groundPoint.dy + _h[8];
-    if (den == 0) den = 1.0;
-    double bx = (_h[0] * groundPoint.dx + _h[1] * groundPoint.dy + _h[2]) / den;
-    double by = (_h[3] * groundPoint.dx + _h[4] * groundPoint.dy + _h[5]) / den;
+    // 🌟 입력 정규화 (솔버와 동일하게)
+    double x = g.dx / 640.0;
+    double y = g.dy / 480.0;
 
-    // double zDiff = (zValue - referenceZ) / referenceZ;
-    // bx += (bx - 960) * zDiff * zSensitivity;
-    // by += (by - 540) * zDiff * zSensitivity;
+    if (_coeffs.every((c) => c == 0.0)) return Offset(g.dx * 3.0, g.dy * 2.25);
 
-    // 3. 9포인트 잔차 보정 (Bilinear Interpolation)
-    Offset residual = _applyBilinearCorrection(bx, by);
-    double finalX = bx + residual.dx;
-    double finalY = by + residual.dy;
+    // 2차 다항식 연산
+    double nux = _coeffs[0] + _coeffs[1] * x + _coeffs[2] * y +
+        _coeffs[3] * x * y + _coeffs[4] * x * x + _coeffs[5] * y * y;
+    double nuy = _coeffs[6] + _coeffs[7] * x + _coeffs[8] * y +
+        _coeffs[9] * x * y + _coeffs[10] * x * x + _coeffs[11] * y * y;
 
-    // [추가] 실시간 UI 좌표 로그 (컵 업데이트 시에만 출력)
-    if (showLog && AppConstants.isDebug) {
-      debugPrint("🎯 [UI_COORD] X: ${finalX.toStringAsFixed(1)}, Y: ${finalY.toStringAsFixed(1)}");
+    // 🌟 결과 복원 (0~1 범위를 다시 픽셀로)
+    double ux = nux * 1920.0;
+    double uy= nuy * 1080.0;
+
+    Offset interpolation = _calculateInterpolatedOffset(ux, uy);
+
+    return Offset(ux + interpolation.dx, uy + interpolation.dy);
+  }
+
+  static bool isCalibrationMode = false;
+
+  static Offset applyVisualPull(Offset mathOffset) {
+    if (isCalibrationMode) {
+      return mathOffset;
     }
+    // 1. 중심으로부터의 거리 계산
+    double dx = mathOffset.dx - 960;
+    double dy = mathOffset.dy - 540;
+    double dist = math.sqrt(dx * dx + dy * dy);
+    double baseGain = 0.72;
+    // 2. 다이내믹 게인 계산
+    // 중심(dist=0)에 가까울수록 uiPostGain(0.88)에 가깝고,
+    // 멀어질수록(dist가 커질수록) Gain이 1.0에 가까워지도록(덜 당기도록) 설계합니다.
+    // 1100은 화면 대각선 끝까지의 대략적인 거리입니다.
+    double releaseFactor = 0.18;
+    double dynamicGain = baseGain + (dist / 1050) * releaseFactor;
 
-    if (showLog && residual != Offset.zero) {
-      debugPrint("🛠️ [Correction Applied] Raw_UI: ($bx, $by) -> Residual: (${residual.dx.toStringAsFixed(1)}, ${residual.dy.toStringAsFixed(1)})");
-    }
+    // Gain이 1.0을 넘지 않도록 제한
+    dynamicGain = dynamicGain.clamp(0.0, 1.0);
+
+    double finalX = 960 + dx * dynamicGain;
+    double finalY = 540 + dy * dynamicGain;
+
+    // 디버깅을 위해 로그에 dynamicGain을 찍어줍니다.
+    debugPrint("[TRACE] Dynamic Gain applied: ${dynamicGain.toStringAsFixed(3)} at dist: ${dist.toInt()}");
 
     return Offset(finalX, finalY);
   }
 
-  static Offset _applyBilinearCorrection(double x, double y) {
-    // 9개 지점을 4개의 사각형 구역으로 나누어 보간 수행
-    // x, y 좌표가 어느 사분면에 있는지 판단 (예: 좌상단, 우상단 등)
-    // 여기서는 간략화를 위해 가장 가까운 4개 점의 가중치 평균 사용
-
-    // 9개 지점의 UI 좌표 정의 (CalibrationScreen의 targetPoints와 동일해야 함)
+  /// IDW(Inverse Distance Weighting) 보간 로직 (기존과 동일)
+  static Offset _calculateInterpolatedOffset(double x, double y) {
     final List<Offset> targets = [
       const Offset(960, 540), const Offset(150, 150), const Offset(1770, 150),
       const Offset(1770, 930), const Offset(150, 930), const Offset(960, 150),
@@ -142,28 +124,44 @@ class CoordinateTransformer {
     double resY = 0;
 
     for (int i = 0; i < 9; i++) {
-      double dist = math.sqrt(math.pow(x - targets[i].dx, 2) + math.pow(y - targets[i].dy, 2));
-      // 거리에 반비례하는 가중치 (Inverse Distance Weighting)
+      double dist = (Offset(x, y) - targets[i]).distance;
       double weight = 1.0 / (math.pow(dist, 2.0) + 1.0);
       resX += _residuals[i].dx * weight;
       resY += _residuals[i].dy * weight;
       totalWeight += weight;
     }
-    if (totalWeight == 0) return Offset.zero;
-    return Offset(resX / totalWeight, resY / totalWeight);
+
+    return totalWeight == 0 ? Offset.zero : Offset(resX / totalWeight, resY / totalWeight);
   }
 
-  static Size getUiSize(double rawWidth, double rawHeight) {
-    double w = (rawWidth > 0) ? rawWidth : 80.0;
-    double h = (rawHeight > 0) ? rawHeight : 80.0;
+  static Size getUiSize(double rawWidth, double rawHeight) => Size(rawWidth * 3.17, rawHeight * 3.17);
+  static double getUiDiameter(double rawDiameter) => rawDiameter * 3.17;
 
-    // 크기 변환용 배율은 행렬의 평균 스케일을 추출해 쓸 수도 있으나,
-    // 일관성을 위해 기존에 검증된 scaleX(3.17 등)를 상수로 유지하는 것을 추천합니다.
-    return Size(w * AppConstants.visualSizeScale, h * AppConstants.visualSizeScale);
-  }
+  static void logTrace(String label, double rawX, double rawY, double zValue) {
+    // 1단계: 시차 보정
+    Offset parallax = getFixedParallax(rawX, rawY, zValue);
 
-  static double getUiDiameter(double rawDiameter) {
-    // rawDiameter가 0이면 0 반환, 아니면 배율 적용
-    return rawDiameter > 0 ? rawDiameter * AppConstants.visualSizeScale : 0;
+    // 2단계: 다항식 변환 (정규화 포함)
+    double x = (parallax.dx) / 640.0;
+    double y = (parallax.dy) / 480.0;
+    double nux = _coeffs[0] + _coeffs[1] * x + _coeffs[2] * y + _coeffs[3] * x * y + _coeffs[4] * x * x + _coeffs[5] * y * y;
+    double nuy = _coeffs[6] + _coeffs[7] * x + _coeffs[8] * y + _coeffs[9] * x * y + _coeffs[10] * x * x + _coeffs[11] * y * y;
+    Offset poly = Offset(nux * 1920.0, nuy * 1080.0);
+
+    // 3단계: 보간 적용 (IDW)
+    Offset inter = _calculateInterpolatedOffset(poly.dx, poly.dy);
+    Offset mathFinal = Offset(poly.dx + inter.dx, poly.dy + inter.dy);
+
+    // 4단계: 시각적 당김 적용 (Gain)
+    Offset visualFinal = applyVisualPull(mathFinal);
+
+//     debugPrint("""
+// [TRACE] 🔍 [LABEL: $label]
+// [TRACE]    - [TRACE 0] Raw Input: (${rawX.toInt()}, ${rawY.toInt()}) Z: ${zValue.toInt()}
+// [TRACE]    - [TRACE 1] Parallax : (${parallax.dx.toInt()}, ${parallax.dy.toInt()})
+// [TRACE]    - [TRACE 2] Poly Only: (${poly.dx.toInt()}, ${poly.dy.toInt()})
+// [TRACE]    - [TRACE 3] Math(IDW): (${mathFinal.dx.toInt()}, ${mathFinal.dy.toInt()}) [잔차: ${inter.dx.toInt()}, ${inter.dy.toInt()}]
+// [TRACE]    - [TRACE 4] Visual(G): (${visualFinal.dx.toInt()}, ${visualFinal.dy.toInt()}) [Gain: $uiPostGain]
+//   """);
   }
 }

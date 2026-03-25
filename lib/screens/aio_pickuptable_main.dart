@@ -16,7 +16,7 @@ import '../components/animation_kit.dart';
 import '../components/arc_text_painter.dart';
 import '../components/hand_detection_overlay.dart';
 import '../services/coordinate_transformer.dart';
-import '../services/homography_solver.dart';
+import '../services/Polynomial_solver.dart';
 import '../services/order_manager.dart';
 import '../services/socket_server_service.dart';
 import '../models/pickup_data.dart';
@@ -89,6 +89,8 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
   Timer? _handDetectionTimer;
 
   Map<String, ui.Image> _iconImages = {};
+  int _irValue = 51;
+  int? _lastSentIrValue;
 
   final GlobalKey<CalibrationScreenState> _calibKey = GlobalKey<CalibrationScreenState>();
 
@@ -145,6 +147,8 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
     _initializeServer();
     _logCurrentServerIp();
     _loadIcons();
+    /// ir 값 변경 커멘드
+    //Future.delayed(Duration(seconds: 3), () => _sendIrValueToPi(51));
   }
 
   Future<void> _loadIcons() async {
@@ -164,17 +168,10 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
 
   Future<void> _loadSavedCalibration() async {
     final prefs = await SharedPreferences.getInstance();
-
-    // 1. 호모그래피 행렬 불러오기
-    final String? matrixJson = prefs.getString('homography_matrix');
-    if (matrixJson != null) {
-      try {
-        List<double> matrix = List<double>.from(jsonDecode(matrixJson));
-        CoordinateTransformer.setHomographyMatrix(matrix);
-        //debugPrint("✅ [Load] Homography Matrix restored.");
-      } catch (e) {
-        //debugPrint("❌ [Error] Matrix load failed: $e");
-      }
+    final String? coeffsJson = prefs.getString('polynomial_coeffs');
+    if (coeffsJson != null) {
+      List<double> coeffs = List<double>.from(jsonDecode(coeffsJson));
+      CoordinateTransformer.setPolynomialCoefficients(coeffs);
     }
 
     // final double? savedFL = prefs.getDouble('focal_length');
@@ -198,6 +195,32 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
         //debugPrint("❌ [Error] Residuals load failed: $e");
       }
     }
+    setState(() {
+      _irValue = prefs.getInt('ir_value') ?? 51;
+      _lastSentIrValue = _irValue;
+    });
+  }
+
+  void _sendIrValueToPi(int newValue) async {
+    int clampedValue = newValue.clamp(0, 61);
+    if (_lastSentIrValue == clampedValue) {
+      //debugPrint("⚠️ [IR_CONTROL] 현재 값($clampedValue)이 이전과 동일하여 전송을 스킵합니다. (리부팅 방지)");
+      return;
+    }
+    setState(() => _irValue = clampedValue);
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('ir_value', clampedValue);
+
+    // 현재 연결된 모든 클라이언트(라즈베리 파이 포함)에게 전송
+    _serverService.sendMessage(jsonEncode({
+      "event_type": "set_ir",
+      "ir_value": clampedValue,
+    }));
+
+    _lastSentIrValue = clampedValue;
+
+    debugPrint("📤 [IR_CONTROL] IR Value Broadcast: $clampedValue");
   }
 
   String _buildComplexLabel(Map<String, dynamic> info) {
@@ -313,124 +336,84 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
   }
 
   void _processCalibration(List<CalibrationPair> data) async {
-    //_addLog("SYS", "🎯 9-Point Calibration Data Collected");
-
-    List<Point<double>> srcPoints =
-        data.map((e) => Point(e.src.dx, e.src.dy)).toList();
-    List<double> zs = data.map((e) => e.z).toList();
-    List<Point<double>> dstPoints =
-        data.map((e) => Point(e.dst.dx, e.dst.dy)).toList();
-
     try {
-      // 1. 호모그래피 행렬 계산 (한 번만 수행)
-      final Matrix hMatrix = HomographySolver.solve(srcPoints, zs, dstPoints);
+      debugPrint("🚀 [ROI_DEBUG] --- ROI 계산 시작 ---");
 
-      String matrixLog = "";
-      for (int i = 0; i < 3; i++) {
-        matrixLog +=
-            "[${hMatrix[i][0].toStringAsFixed(4)}, ${hMatrix[i][1].toStringAsFixed(4)}, ${hMatrix[i][2].toStringAsFixed(4)}] ";
-      }
-      debugPrint("📊 생성된 행렬: $matrixLog");
+      // 1. 순방향/역방향 계수 추출
+      final srcPoints = data.map((e) => Point(e.src.dx, e.src.dy)).toList();
+      final zValues = data.map((e) => e.z).toList(); // 🌟 Z값 리스트 추가
+      final dstPoints = data.map((e) => Point(e.dst.dx, e.dst.dy)).toList();
 
-      // 2. 행렬 값 리스트화 및 적용
-      List<double> matrixValues = [
-        hMatrix[0][0],
-        hMatrix[0][1],
-        hMatrix[0][2],
-        hMatrix[1][0],
-        hMatrix[1][1],
-        hMatrix[1][2],
-        hMatrix[2][0],
-        hMatrix[2][1],
-        hMatrix[2][2],
-      ];
-      List<Offset> residuals = data.map((e) => e.residual).toList();
+      // 2. 솔버 호출 (zValues 전달)
+      var results = PolynomialSolver.solveAll(srcPoints, zValues, dstPoints);
 
-      CoordinateTransformer.setHomographyMatrix(matrixValues);
-      CoordinateTransformer.updateResiduals(residuals);
+      List<double> fwd = results['forward']!;
+      List<double> inv = results['inverse']!;
 
+      // 2. Transformer 업데이트 및 저장
+      CoordinateTransformer.setPolynomialCoefficients(fwd);
       final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('polynomial_coeffs', jsonEncode(fwd));
 
-      await prefs.setString('homography_matrix', jsonEncode(matrixValues));
+      // 3. ROI 역산 로직
+      // double invParallaxRatio = AppConstants.totalSensorHeight / (AppConstants.totalSensorHeight - 110.0);
+      double invParallaxRatio = 1.25;
+      debugPrint("📊 [ROI_DEBUG] 시차 역산 배율: ${invParallaxRatio.toStringAsFixed(3)}");
 
-      // ✅ [추가] Solver가 찾아낸 최적의 focalLength를 저장합니다.
-      await prefs.setDouble('focal_length', CoordinateTransformer.focalLength);
-
-      // 잔차 저장
-      List<Map<String, double>> residualMap =
-      residuals.map((r) => {'dx': r.dx, 'dy': r.dy}).toList();
-      await prefs.setString('calibration_residuals', jsonEncode(residualMap));
-
-      debugPrint("✅ [Storage] Matrix & Residuals successfully saved.");
-      //_addLog("SYS", "🎯 캘리브레이션 완료 및 저장 성공!");
-
-      // 4. ROI 역산 및 라즈베리파이 전송
-      final Matrix invH = hMatrix.inverse(); // 역행렬 계산
       final List<Map<String, dynamic>> roiConfigs = [
         {"id": 1, "name": "Top-Left", "pos": const Offset(0, 0)},
-        {"id": 2, "name": "Top-Right", "pos": const Offset(1920, 0)}, // 1920 -> 2050
+        {"id": 2, "name": "Top-Right", "pos": const Offset(1920, 0)},
         {"id": 3, "name": "Bottom-Left", "pos": const Offset(0, 1080)},
-        {"id": 4, "name": "Bottom-Right", "pos": const Offset(1920, 1080)}, // 1080 -> 1180
+        {"id": 4, "name": "Bottom-Right", "pos": const Offset(1920, 1080)},
         {"id": 5, "name": "Center", "pos": const Offset(960, 540)},
       ];
 
       List<Map<String, dynamic>> roiPoints = [];
-      //_addLog("SYS", "📡 ROI Mapping (UI -> Camera Raw)");
 
       for (var config in roiConfigs) {
-        final int id = config["id"];
-        final String name = config["name"];
-        final Offset uiPos = config["pos"];
+        double ux = config["pos"]!.dx / 1920.0; // UI 정규화
+        double uy = config["pos"]!.dy / 1080.0;
 
-        // 1단계: 역 호모그래피 (UI -> 지면)
-        double den = invH[2][0] * uiPos.dx + invH[2][1] * uiPos.dy + invH[2][2];
-        double gx = (invH[0][0] * uiPos.dx + invH[0][1] * uiPos.dy + invH[0][2]) / den;
-        double gy = (invH[1][0] * uiPos.dx + invH[1][1] * uiPos.dy + invH[1][2]) / den;
+        // 역방향 다항식 적용 (결과: 정규화된 센서지면)
+        double ngx = inv[0] + inv[1]*ux + inv[2]*uy + inv[3]*ux*uy + inv[4]*ux*ux + inv[5]*uy*uy;
+        double ngy = inv[6] + inv[7]*ux + inv[8]*uy + inv[9]*ux*uy + inv[10]*ux*ux + inv[11]*uy*uy;
 
-        // 2단계: 역 렌즈 보정 (지면 -> 센서 Raw)
-        double rawX = gx;
-        double rawY = gy;
-        const double cx = CoordinateTransformer.opticalCenterX;
-        const double cy = CoordinateTransformer.opticalCenterY;
-        const double k1_for_roi = 0.0;
+        // 정규화 해제 (0~1 -> 0~640)
+        double gx = ngx * 640.0;
+        double gy = ngy * 480.0;
 
-        if (k1_for_roi != 0) {
-          for (int i = 0; i < 5; i++) {
-            double nx = (rawX - cx) / CoordinateTransformer.focalLength;
-            double ny = (rawY - cy) / CoordinateTransformer.focalLength;
-            double r2 = nx * nx + ny * ny;
-            double distortion = 1 + k1_for_roi * r2;
-            rawX = cx + (gx - cx) / distortion;
-            rawY = cy + (gy - cy) / distortion;
-          }
-        }
-        // // 호모그래피 역행렬을 이용한 좌표 변환 공식
-        // // x' = (h11*x + h12*y + h13) / (h31*x + h32*y + h33)
-        // double den = invH[2][0] * uiPos.dx + invH[2][1] * uiPos.dy + invH[2][2];
-        // double rx =
-        //     (invH[0][0] * uiPos.dx + invH[0][1] * uiPos.dy + invH[0][2]) / den;
-        // double ry =
-        //     (invH[1][0] * uiPos.dx + invH[1][1] * uiPos.dy + invH[1][2]) / den;
+        // 시차 보정 역산 (바닥 -> 센서 윗면)
+        double rawX = 320.0 + (gx - 320.0) * invParallaxRatio;
+        double rawY = 240.0 + (gy - 240.0) * invParallaxRatio;
 
-        //_addLog("ROI",
-        //    "ID:$id ($name): Raw(${rx.toStringAsFixed(1)}, ${ry.toStringAsFixed(1)})");
+        // 최종 클램핑
+        double finalX = rawX.clamp(0.0, 640.0);
+        double finalY = rawY.clamp(0.0, 480.0);
 
-        // 전송용 리스트에 ID와 좌표 추가
+        debugPrint("📍 [ROI_DEBUG] ${config['name']}: "
+            "UI(${config['pos']!.dx.toInt()}, ${config['pos']!.dy.toInt()}) "
+            "-> Raw(${finalX.toStringAsFixed(1)}, ${finalY.toStringAsFixed(1)})");
+
         roiPoints.add({
-          "id": id,
-          "x": rawX,
-          "y": rawY,
+          "id": config["id"],
+          "x": finalX,
+          "y": finalY,
         });
       }
 
-      _serverService.sendMessage(jsonEncode({
+      // 4. 전송
+      String packet = jsonEncode({
         "event_type": "set_roi",
         "timestamp": DateTime.now().toIso8601String(),
         "roi_points": roiPoints,
-      }));
-      //_addLog("SYS", "📤 ROI Packet Sent to Raspberry Pi");
-    } catch (e) {
-      //_addLog("ERR", "Calibration/ROI Error: $e");
+      });
+
+      _serverService.sendMessage(packet);
+      debugPrint("📤 [ROI_DEBUG] Packet Sent: $packet");
+
+    } catch (e, stack) {
+      debugPrint("❌ [ROI_DEBUG] Error: $e");
+      debugPrint(stack.toString());
     }
   }
 
@@ -439,6 +422,13 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
   void _initializeServer() {
     _serverService = SocketServerService(
         onLog: (msg, {bool force = false}) => _addLog("SYS", msg, force: true),
+        onClientConnected: (ip) {
+          debugPrint("📡 [IR_CONTROL] 클라이언트 접속 확인($ip)! 0.5초 뒤 IR 설정값 전송");
+          // 연결 직후 소켓 버퍼 안정을 위해 아주 짧은 지연 후 전송
+          Future.delayed(const Duration(milliseconds: 500), () {
+            _sendIrValueToPi(_irValue);
+          });
+        },
         onOrderReceived: () {
           if (mounted) setState(() => _updateGuidePositions());
         },
@@ -475,13 +465,13 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
           }
         },
         onDataReceived: (TofFrame frame) {
-          if (frame.baseZ != null) {
-            CoordinateTransformer.updateFloorHeight(frame.baseZ!);
-          }
+          // if (frame.baseZ != null) {
+          //   CoordinateTransformer.updateFloorHeight(frame.baseZ!);
+          // }
           if (frame.objects.isNotEmpty) {
             var obj = frame.objects.first;
             setState(() {
-              _latestRawForCalib = CoordinateTransformer.getParallaxCorrectedOffset(obj.x, obj.y, obj.z);
+              _latestRawForCalib = CoordinateTransformer.getFixedParallax(obj.x, obj.y, obj.z);
               _lastFrameObjects = frame.objects;
             });
           }
@@ -549,6 +539,7 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
     if (validTofObjects.isNotEmpty) {
       debugPrint("☕ [RAW_CUP_FRAME] ID:${frame.frameId}");
       for (var obj in validTofObjects) {
+        CoordinateTransformer.logTrace("LIVE_CUP_${obj.id}", obj.x, obj.y, obj.z);
         debugPrint("   > [ID:${obj.id.toString().padLeft(3)}] "
             "x:${obj.x.toStringAsFixed(0).padLeft(3)}, "
             "y:${obj.y.toStringAsFixed(0).padLeft(3)}, "
@@ -560,15 +551,27 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
     }
 
     List<Map<String, dynamic>> sensorInputs = validTofObjects.map((tof) {
-      Offset calibratedPos = CoordinateTransformer.transform(tof.x, tof.y, tof.z, showLog: true);
+      // 1. 수학적으로 정확한 좌표 구함 (Gain 미적용)
+      Offset mathPos = CoordinateTransformer.transform(tof.x, tof.y, tof.z);
+
+      // 2. 🌟 시각적으로 당겨진 좌표 구함 (화면 출력용)
+      Offset visualPos = CoordinateTransformer.applyVisualPull(mathPos);
+      debugPrint("☕ [TRACE] ID:${tof.id} | Math:(${mathPos.dx.toInt()}, ${mathPos.dy.toInt()}) -> Visual:(${visualPos.dx.toInt()}, ${visualPos.dy.toInt()})");
       Color idBasedColor = _getColorForId(tof.id);
-      final orderInfo = OrderManager.getOrAssignOrder(tof.id, calibratedPos, idBasedColor);
+      final orderInfo = OrderManager.getOrAssignOrder(tof.id, visualPos, idBasedColor);
 
       String displayLabel = "UNKNOWN"; // 기본값
       if (orderInfo != null) {
         displayLabel = _buildComplexLabel(orderInfo);
       }
-      return {'id': tof.id, 'pos': calibratedPos, 'raw': tof, 'label': displayLabel, 'finalColor': orderInfo?['color'] ?? Colors.white54};
+      return {
+        'id': tof.id,
+        'pos': visualPos, // 렌더링용 좌표
+        'mathPos': mathPos, // 로직용 좌표 (필요시)
+        'raw': tof,
+        'label': displayLabel,
+        'finalColor': orderInfo?['color'] ?? Colors.white54
+      };
     }).toList();
 
     List<DetectedObject> tempList = [];
