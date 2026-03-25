@@ -7,7 +7,7 @@
 
   import '../config/app_constants.dart';
   import '../services/coordinate_transformer.dart';
-  import '../services/homography_solver.dart';
+  import '../services/Polynomial_solver.dart';
 
   class CalibrationPair {
     final Offset src; // 센서 Raw (x, y)
@@ -229,58 +229,121 @@
       });
     }
 
+    // void _enterValidationMode() {
+    //   try {
+    //     // 1. [핵심] 업체 데이터 기반으로 focalLength 고정 (더 이상 찾지 않음)
+    //     final double fixedFL = CoordinateTransformer.focalLength;
+    //
+    //     debugPrint("🎯 [Auto-Solver] Fixed FocalLength Applied: $fixedFL mm");
+    //
+    //     // 2. 보정된 소스 좌표 생성 (320.0 기준으로 시차 보정 수행)
+    //     final List<math.Point<double>> src = collectedPairs.map((p) {
+    //       Offset corrected = CoordinateTransformer.getParallaxCorrectedOffset(p.src.dx, p.src.dy, p.z);
+    //       return math.Point(corrected.dx, corrected.dy);
+    //     }).toList();
+    //
+    //     final List<double> zs = collectedPairs.map((p) => p.z).toList();
+    //     final List<math.Point<double>> dst = collectedPairs.map((p) => math.Point(p.dst.dx, p.dst.dy)).toList();
+    //
+    //     // 3. 호모그래피 행렬 계산
+    //     final Matrix hMatrix = HomographySolver.solve(src, zs, dst);
+    //
+    //     // 4. 계산된 행렬을 Transformer에 즉시 반영
+    //     List<double> matrixValues = [
+    //       hMatrix[0][0], hMatrix[0][1], hMatrix[0][2],
+    //       hMatrix[1][0], hMatrix[1][1], hMatrix[1][2],
+    //       hMatrix[2][0], hMatrix[2][1], hMatrix[2][2],
+    //     ];
+    //     CoordinateTransformer.setHomographyMatrix(matrixValues);
+    //
+    //     CoordinateTransformer.updateResiduals(
+    //         collectedPairs.map((p) => p.residual).toList()
+    //     );
+    //
+    //     // 5. 검증용 결과 좌표들 계산
+    //     _transformedPoints.clear();
+    //     _errors.clear();
+    //
+    //     for (var pair in collectedPairs) {
+    //       Offset transformed = CoordinateTransformer.transform(
+    //           pair.src.dx,
+    //           pair.src.dy,
+    //           pair.z
+    //       );
+    //
+    //       _transformedPoints.add(transformed);
+    //       _errors.add((transformed - pair.dst).distance);
+    //     }
+    //
+    //     setState(() => _isValidationMode = true);
+    //     widget.onValidationEntered?.call();
+    //   } catch (e) {
+    //     debugPrint("❌ Validation Error: $e");
+    //     _restartCalibration();
+    //   }
+    // }
     void _enterValidationMode() {
       try {
-        // 1. [핵심] 업체 데이터 기반으로 focalLength 고정 (더 이상 찾지 않음)
-        final double fixedFL = CoordinateTransformer.focalLength;
-
-        debugPrint("🎯 [Auto-Solver] Fixed FocalLength Applied: $fixedFL mm");
-
-        // 2. 보정된 소스 좌표 생성 (320.0 기준으로 시차 보정 수행)
-        final List<math.Point<double>> src = collectedPairs.map((p) {
-          Offset corrected = CoordinateTransformer.getParallaxCorrectedOffset(p.src.dx, p.src.dy, p.z);
-          return math.Point(corrected.dx, corrected.dy);
-        }).toList();
-
-        final List<double> zs = collectedPairs.map((p) => p.z).toList();
+        // 1. 포인트 데이터 준비 (math.Point 형식)
+        final List<math.Point<double>> src = collectedPairs.map((p) => math.Point(p.src.dx, p.src.dy)).toList();
         final List<math.Point<double>> dst = collectedPairs.map((p) => math.Point(p.dst.dx, p.dst.dy)).toList();
+        final List<double> zs = collectedPairs.map((p) => p.z).toList();
 
-        // 3. 호모그래피 행렬 계산
-        final Matrix hMatrix = HomographySolver.solve(src, zs, dst);
+        // 2. [수정] 대표님 방식: PolynomialSolver를 사용하여 순방향/역방향 계수 모두 산출
+        final results = PolynomialSolver.solveAll(src, zs, dst);
+        final List<double> fwdCoeffs = results['forward']!;
 
-        // 4. 계산된 행렬을 Transformer에 즉시 반영
-        List<double> matrixValues = [
-          hMatrix[0][0], hMatrix[0][1], hMatrix[0][2],
-          hMatrix[1][0], hMatrix[1][1], hMatrix[1][2],
-          hMatrix[2][0], hMatrix[2][1], hMatrix[2][2],
-        ];
-        CoordinateTransformer.setHomographyMatrix(matrixValues);
+        // 3. [수정] Transformer에 12개 계수 전송 (행렬 대신 계수 세터 사용)
+        CoordinateTransformer.setPolynomialCoefficients(fwdCoeffs);
 
-        CoordinateTransformer.updateResiduals(
-            collectedPairs.map((p) => p.residual).toList()
-        );
+        // 4. 현재까지의 미세조정(Residuals) 값 반영
+        CoordinateTransformer.updateResiduals(collectedPairs.map((p) => p.residual).toList());
 
-        // 5. 검증용 결과 좌표들 계산
-        _transformedPoints.clear();
-        _errors.clear();
+        // 5. 검증 화면용 프리뷰 포인트 갱신
+        _updatePreviewPoints();
 
-        for (var pair in collectedPairs) {
-          Offset transformed = CoordinateTransformer.transform(
-              pair.src.dx,
-              pair.src.dy,
-              pair.z
-          );
+        setState(() {
+          _isValidationMode = true;
+          _isCountingDown = false; // 카운트다운 초기화
+        });
 
-          _transformedPoints.add(transformed);
-          _errors.add((transformed - pair.dst).distance);
-        }
-
-        setState(() => _isValidationMode = true);
         widget.onValidationEntered?.call();
+        debugPrint("✅ [CalibrationScreen] 다항식 모델로 검증 모드 진입");
       } catch (e) {
-        debugPrint("❌ Validation Error: $e");
+        debugPrint("❌ Calibration Error: $e");
         _restartCalibration();
       }
+    }
+
+    // 2. 추가된 _updatePreviewPoints (미세조정 시 실시간 반영용)
+    void _updatePreviewPoints() {
+      List<Offset> newPoints = [];
+      List<double> newErrors = [];
+
+      debugPrint("📊 [TRACE] --- 검증 데이터 분석 시작 ---");
+
+      for (int i = 0; i < collectedPairs.length; i++) {
+        var p = collectedPairs[i];
+        // 갱신된 행렬과 잔차가 적용된 transform 호출
+        CoordinateTransformer.logTrace("VALID_POINT_${i + 1}", p.src.dx, p.src.dy, p.z);
+        Offset mathRes = CoordinateTransformer.transform(p.src.dx, p.src.dy, p.z);
+
+        // 2. 시각적 당김 좌표 (프리뷰 원 표시용)
+        Offset visualRes = CoordinateTransformer.applyVisualPull(mathRes);
+
+        double mathError = (mathRes - targetPoints[i]).distance;
+        double visualError = (visualRes - targetPoints[i]).distance;
+
+        debugPrint("[TRACE] POINT ${i + 1} | MathErr: ${mathError.toStringAsFixed(1)}px | VisualErr: ${visualError.toStringAsFixed(1)}px");
+
+        newPoints.add(visualRes); // 화면에는 당겨진 위치에 원을 그림
+        newErrors.add(mathError);
+      }
+
+      setState(() {
+        _transformedPoints = newPoints;
+        _errors = newErrors;
+      });
     }
 
     void _restartCalibration() {
@@ -320,7 +383,17 @@
     }
 
     @override
+    void initState() {
+      super.initState();
+      // 🌟 진입 시 캘리브레이션 모드 활성화 (Gain 무효화)
+      CoordinateTransformer.isCalibrationMode = true;
+      //debugPrint("🛠 [MODE] 캘리브레이션 모드 진입: Gain 비활성화");
+    }
+
+    @override
     void dispose() {
+      CoordinateTransformer.isCalibrationMode = false;
+      //debugPrint("🚀 [MODE] 캘리브레이션 모드 종료: Gain 활성화");
       _countdownTimer?.cancel();
       super.dispose();
     }
@@ -425,7 +498,7 @@
                 width: 100,
                 child: Center(
                   child: Text(
-                    "Z: ${collectedPairs[i].z.toInt()}mm",
+                    "v-Z: ${CoordinateTransformer.getCorrectedZ(collectedPairs[i].src.dx, collectedPairs[i].src.dy, collectedPairs[i].z).toInt()}mm",
                     style: const TextStyle(
                       color: Colors.white70,
                       fontSize: 12,
@@ -594,21 +667,17 @@
     bool _isFineTuningMode = false;
     int _selectedFineTuneIndex = 0; // 현재 미세 조정 중인 포인트 (0~8)
 
-// 미세 조정 핸들러
     void _adjustResidual(double dx, double dy) {
       setState(() {
+        // 1. 현재 선택된 포인트의 잔차 업데이트
         Offset current = collectedPairs[_selectedFineTuneIndex].residual;
         collectedPairs[_selectedFineTuneIndex].residual = current + Offset(dx, dy);
 
-        _updateTransformerPreview();
+        // 2. Transformer에 실시간 잔차 목록 업데이트
+        CoordinateTransformer.updateResiduals(collectedPairs.map((p) => p.residual).toList());
 
-        _transformedPoints[_selectedFineTuneIndex] = CoordinateTransformer.transform(
-          collectedPairs[_selectedFineTuneIndex].src.dx,
-          collectedPairs[_selectedFineTuneIndex].src.dy,
-          collectedPairs[_selectedFineTuneIndex].z,
-        );
-
-        _errors[_selectedFineTuneIndex] = (_transformedPoints[_selectedFineTuneIndex] - targetPoints[_selectedFineTuneIndex]).distance;
+        // 3. [중요] 다항식 기반으로 프리뷰 좌표들 다시 계산
+        _updatePreviewPoints();
       });
     }
 

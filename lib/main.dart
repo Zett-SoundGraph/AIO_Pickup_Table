@@ -1,5 +1,3 @@
-// lib/main.dart
-
 import 'package:flutter/material.dart';
 import 'screens/aio_pickuptable_main.dart'; // 메인 화면 import
 import 'package:media_kit/media_kit.dart';

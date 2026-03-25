@@ -28,6 +28,7 @@ class SocketServerService {
   final bool _useIpCheck = false;
   final VoidCallback? onOrderReceived;
   final VoidCallback? onCalibrationRequested;
+  final Function(String? ip)? onClientConnected;
 
   SocketServerService({
     required this.onLog,
@@ -35,6 +36,7 @@ class SocketServerService {
     this.onOrderReceived,
     this.onCalibrationRequested,
     this.onFineTuneCommand,
+    this.onClientConnected,
   });
 
   // IP 접근 허용 여부 판단
@@ -89,6 +91,7 @@ class SocketServerService {
     // 허용된 IP 연결
     onLog("인증된 클라이언트 연결됨 ($clientIp)", force: true);
     debugPrint("인증된 클라이언트 연결됨 ($clientIp)");
+    onClientConnected?.call(clientIp);
 
     socket.listen(
           (data) {
