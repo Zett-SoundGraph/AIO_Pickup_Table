@@ -4,6 +4,9 @@ import 'package:flutter/material.dart';
 import '../config/app_constants.dart';
 
 class CoordinateTransformer {
+  static double _lerp(double a, double b, double t) {
+    return a + (b - a) * t;
+  }
   // 🌟 [변경] 기존 _h(9개) 대신 대표님 방식의 12개 계수 저장 (ax1~6, ay1~6)
   static List<double> _coeffs = List.filled(12, 0.0);
   static List<Offset> _residuals = List.generate(9, (_) => Offset.zero);
@@ -15,7 +18,7 @@ class CoordinateTransformer {
   static const double _fx = 290.0;
   static const double _fy = 320.0;
 
-  static double uiPostGain = 1.0;
+  //static double uiPostGain = 1.0;
 
   static void updateResiduals(List<Offset> newResiduals) {
     _residuals = newResiduals;
@@ -83,32 +86,81 @@ class CoordinateTransformer {
 
   static bool isCalibrationMode = false;
 
-  static Offset applyVisualPull(Offset mathOffset) {
+  static Offset applyVisualPull(Offset mathOffset, double zValue) {
     if (isCalibrationMode) {
       return mathOffset;
     }
     // 1. 중심으로부터의 거리 계산
-    double dx = mathOffset.dx - 960;
-    double dy = mathOffset.dy - 540;
-    double dist = math.sqrt(dx * dx + dy * dy);
-    double baseGain = 0.72;
-    // 2. 다이내믹 게인 계산
-    // 중심(dist=0)에 가까울수록 uiPostGain(0.88)에 가깝고,
-    // 멀어질수록(dist가 커질수록) Gain이 1.0에 가까워지도록(덜 당기도록) 설계합니다.
-    // 1100은 화면 대각선 끝까지의 대략적인 거리입니다.
-    double releaseFactor = 0.18;
-    double dynamicGain = baseGain + (dist / 1050) * releaseFactor;
+    // double dx = mathOffset.dx - 960;
+    // double dy = mathOffset.dy - 540;
+    // double dist = math.sqrt(dx * dx + dy * dy);
+    const Offset center = Offset(960, 540);
 
-    // Gain이 1.0을 넘지 않도록 제한
-    dynamicGain = dynamicGain.clamp(0.0, 1.0);
+    double vx = mathOffset.dx - center.dx;
+    double vy = mathOffset.dy - center.dy;
+    double d = math.sqrt(vx * vx + vy * vy);
 
-    double finalX = 960 + dx * dynamicGain;
-    double finalY = 540 + dy * dynamicGain;
+    if (d < 1.0) return mathOffset;
 
-    // 디버깅을 위해 로그에 dynamicGain을 찍어줍니다.
-    debugPrint("[TRACE] Dynamic Gain applied: ${dynamicGain.toStringAsFixed(3)} at dist: ${dist.toInt()}");
+    const double leftWeight = 1.75;
+    const double rightWeight = 1.35;
+    const double topWeight = 0.95;
+    const double bottomWeight = 0.65;
+
+    double tx = (vx / d).clamp(-1.0, 1.0);
+    double ty = (vy / d).clamp(-1.0, 1.0);
+
+    double horizontalW = (tx < 0) ? _lerp(1.0, leftWeight, tx.abs()) : _lerp(1.0, rightWeight, tx.abs());
+    double verticalW = (ty < 0) ? _lerp(1.0, topWeight, ty.abs()) : _lerp(1.0, bottomWeight, ty.abs());
+    double finalW = (horizontalW + verticalW) / 2.0;
+
+    const double refCupHeight = 110.0;
+    double currentCupHeight = (AppConstants.totalSensorHeight - zValue).clamp(50.0, 250.0);
+    double heightWeight = currentCupHeight / refCupHeight;
+
+    // 3. 이차함수 기반 Pull량(Pixel) 계산
+    // PullAmount = (a * d^2 + b * d) * heightWeight
+    // 초기 계수 (현장 테스트 후 미세조정 필요)
+    const double a = 0.00000012;
+    const double b = 0.16;
+
+    double pullPixel = (a * math.pow(d, 3) + b * d) * heightWeight * finalW;
+
+    // 4. 방향 벡터 정규화 (Unit Vector)
+    double unitX = vx / d;
+    double unitY = vy / d;
+
+    // 5. 최종 좌표: 수학적 좌표에서 중심 방향으로 pullPixel만큼 이동
+    double finalX = mathOffset.dx - (unitX * pullPixel);
+    double finalY = mathOffset.dy - (unitY * pullPixel);
 
     return Offset(finalX, finalY);
+
+    // const double referenceZ = 980.0;
+    // const double sensorHeight = 1090.0; // 실제 설치 높이 (AppConstants.totalSensorHeight)
+
+    // // 현재 컵의 높이 비율 vs 기준 컵의 높이 비율
+    // double currentRatio = (zValue / sensorHeight).clamp(0.5, 1.0);
+    // double referenceRatio = (referenceZ / sensorHeight);
+    //
+    // double adaptiveBaseGain = 0.65 * (currentRatio / referenceRatio);
+    // // 2. 다이내믹 게인 계산
+    // // 중심(dist=0)에 가까울수록 uiPostGain(0.88)에 가깝고,
+    // // 멀어질수록(dist가 커질수록) Gain이 1.0에 가까워지도록(덜 당기도록) 설계합니다.
+    // // 1100은 화면 대각선 끝까지의 대략적인 거리입니다.
+    // double releaseFactor = 0.25;
+    // double dynamicGain = adaptiveBaseGain + (dist / 1050) * releaseFactor;
+    //
+    // // Gain이 1.0을 넘지 않도록 제한
+    // dynamicGain = dynamicGain.clamp(0.0, 1.0);
+    //
+    // double finalX = 960 + dx * dynamicGain;
+    // double finalY = 540 + dy * dynamicGain;
+    //
+    // // 디버깅을 위해 로그에 dynamicGain을 찍어줍니다.
+    // debugPrint("[TRACE] Dynamic Gain applied: ${dynamicGain.toStringAsFixed(3)} at dist: ${dist.toInt()}");
+    //
+    // return Offset(finalX, finalY);
   }
 
   /// IDW(Inverse Distance Weighting) 보간 로직 (기존과 동일)
@@ -153,15 +205,19 @@ class CoordinateTransformer {
     Offset mathFinal = Offset(poly.dx + inter.dx, poly.dy + inter.dy);
 
     // 4단계: 시각적 당김 적용 (Gain)
-    Offset visualFinal = applyVisualPull(mathFinal);
+    Offset visualFinal = applyVisualPull(mathFinal, zValue);
 
-//     debugPrint("""
-// [TRACE] 🔍 [LABEL: $label]
-// [TRACE]    - [TRACE 0] Raw Input: (${rawX.toInt()}, ${rawY.toInt()}) Z: ${zValue.toInt()}
-// [TRACE]    - [TRACE 1] Parallax : (${parallax.dx.toInt()}, ${parallax.dy.toInt()})
-// [TRACE]    - [TRACE 2] Poly Only: (${poly.dx.toInt()}, ${poly.dy.toInt()})
-// [TRACE]    - [TRACE 3] Math(IDW): (${mathFinal.dx.toInt()}, ${mathFinal.dy.toInt()}) [잔차: ${inter.dx.toInt()}, ${inter.dy.toInt()}]
-// [TRACE]    - [TRACE 4] Visual(G): (${visualFinal.dx.toInt()}, ${visualFinal.dy.toInt()}) [Gain: $uiPostGain]
-//   """);
+    double dx = mathFinal.dx - 960;
+    double dy = mathFinal.dy - 540;
+    double d = math.sqrt(dx * dx + dy * dy);
+
+    debugPrint("""
+[TRACE] 🔍 [LABEL: $label]
+[TRACE]    - [TRACE 0] Raw Input: (${rawX.toInt()}, ${rawY.toInt()}) Z: ${zValue.toInt()}
+[TRACE]    - [TRACE 1] Parallax : (${parallax.dx.toInt()}, ${parallax.dy.toInt()})
+[TRACE]    - [TRACE 2] Poly Only: (${poly.dx.toInt()}, ${poly.dy.toInt()})
+[TRACE]    - [TRACE 3] Math(IDW): (${mathFinal.dx.toInt()}, ${mathFinal.dy.toInt()}) [잔차: ${inter.dx.toInt()}, ${inter.dy.toInt()}]
+[TRACE]    - [TRACE 4] Visual(Q): (${visualFinal.dx.toInt()}, ${visualFinal.dy.toInt()}) [Dist: ${d.toInt()}px]
+  """);
   }
 }

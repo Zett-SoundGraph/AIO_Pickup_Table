@@ -58,9 +58,15 @@
 
     // 디스플레이상의 9개 목표 지점 (1920x1080 기준 적정 마진 적용)
     final List<Offset> targetPoints = [
-      const Offset(960, 540), const Offset(150, 150), const Offset(1770, 150),
-      const Offset(1770, 930), const Offset(150, 930), const Offset(960, 150),
-      const Offset(1770, 540), const Offset(960, 930), const Offset(150, 540),
+      const Offset(960, 540),
+      const Offset(80, 80),
+      const Offset(1840, 80),
+      const Offset(1840, 1000),
+      const Offset(80, 1000),
+      const Offset(960, 80),
+      const Offset(1840, 540),
+      const Offset(960, 1000),
+      const Offset(80, 540),
     ];
 
     @override
@@ -89,7 +95,7 @@
         double normTargetY = targetPoints[currentStep].dy / 1080.0;
 
         double dist = math.sqrt(math.pow(normRawX - normTargetX, 2) + math.pow(normRawY - normTargetY, 2));
-        bool currentlyInside = dist < 0.32;
+        bool currentlyInside = dist < 0.5;
 
         if (_isInsideTarget != currentlyInside) setState(() => _isInsideTarget = currentlyInside);
 
@@ -329,7 +335,7 @@
         Offset mathRes = CoordinateTransformer.transform(p.src.dx, p.src.dy, p.z);
 
         // 2. 시각적 당김 좌표 (프리뷰 원 표시용)
-        Offset visualRes = CoordinateTransformer.applyVisualPull(mathRes);
+        Offset visualRes = CoordinateTransformer.applyVisualPull(mathRes, p.z);
 
         double mathError = (mathRes - targetPoints[i]).distance;
         double visualError = (visualRes - targetPoints[i]).distance;
@@ -409,7 +415,7 @@
           children: [
             _buildTopGuide(activeColor),
             _buildTargetCircle(activeColor),
-            //_buildMinimap(activeColor),
+            _buildMinimap(activeColor),
           ],
         ),
       );

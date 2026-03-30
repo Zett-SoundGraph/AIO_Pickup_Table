@@ -186,7 +186,7 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
       try {
         List<dynamic> decoded = jsonDecode(residualJson);
         List<Offset> residuals = decoded.map((item) =>
-            Offset(item['dx'] as double, item['dy'] as double)
+            Offset((item['dx'] as num).toDouble(), (item['dy'] as num).toDouble())
         ).toList();
 
         CoordinateTransformer.updateResiduals(residuals);
@@ -355,9 +355,17 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('polynomial_coeffs', jsonEncode(fwd));
 
-      // 3. ROI 역산 로직
+      List<Map<String, double>> residualsToSave = data.map((p) => {
+        'dx': p.residual.dx,
+        'dy': p.residual.dy
+      }).toList();
+      await prefs.setString('calibration_residuals', jsonEncode(residualsToSave));
+
+      debugPrint("✅ [Save] 잔차 데이터 저장 완료");
+
+      // 3. ROI 역산 로직  1050 / 940
       // double invParallaxRatio = AppConstants.totalSensorHeight / (AppConstants.totalSensorHeight - 110.0);
-      double invParallaxRatio = 1.25;
+      double invParallaxRatio = 1.0;
       debugPrint("📊 [ROI_DEBUG] 시차 역산 배율: ${invParallaxRatio.toStringAsFixed(3)}");
 
       final List<Map<String, dynamic>> roiConfigs = [
@@ -534,19 +542,41 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
 
   // 1. _processCupUpdate 수정 버전
   void _processCupUpdate(TofFrame frame) {
-    final validTofObjects = frame.objects.where((obj) => obj.x > 5 && obj.y > 5).toList();
+    //final validTofObjects = frame.objects.where((obj) => obj.x > 5 && obj.y > 5).toList();
+    /// 손을 인식하는 문제 일단 반지름이 큰 물체는 거부하도록 임시 대체
+    final validTofObjects = frame.objects.where((obj) {
+      double radius = obj.diameter / 2;
 
+      // 위치가 유효한지 확인
+      bool isValidPos = obj.x > 5 && obj.y > 5;
+      // 반지름이 80mm 이하인지 확인 (사용자님 요청사항)
+      bool isNormalSize = radius <= 80;
+
+      if (!isNormalSize) {
+        //debugPrint("🚫 [FILTER] 거대 노이즈 차단: ID:${obj.id} | r:${radius.toStringAsFixed(1)}mm");
+      }
+
+      return isValidPos && isNormalSize;
+    }).toList();
+
+    // if (validTofObjects.isNotEmpty) {
+    //   debugPrint("☕ [RAW_CUP_FRAME] ID:${frame.frameId}");
+    //   for (var obj in validTofObjects) {
+    //     CoordinateTransformer.logTrace("LIVE_CUP_${obj.id}", obj.x, obj.y, obj.z);
+    //     debugPrint("   > [ID:${obj.id.toString().padLeft(3)}] "
+    //         "x:${obj.x.toStringAsFixed(0).padLeft(3)}, "
+    //         "y:${obj.y.toStringAsFixed(0).padLeft(3)}, "
+    //         "z:${obj.z.toStringAsFixed(0).padLeft(4)}, "
+    //         "w:${obj.width.toStringAsFixed(0).padLeft(3)}, "
+    //         "h:${obj.height.toStringAsFixed(0).padLeft(3)}, "
+    //         "r:${(obj.diameter / 2).toStringAsFixed(1).padLeft(4)}");
+    //   }
+    // }
     if (validTofObjects.isNotEmpty) {
-      debugPrint("☕ [RAW_CUP_FRAME] ID:${frame.frameId}");
       for (var obj in validTofObjects) {
-        CoordinateTransformer.logTrace("LIVE_CUP_${obj.id}", obj.x, obj.y, obj.z);
-        debugPrint("   > [ID:${obj.id.toString().padLeft(3)}] "
-            "x:${obj.x.toStringAsFixed(0).padLeft(3)}, "
-            "y:${obj.y.toStringAsFixed(0).padLeft(3)}, "
-            "z:${obj.z.toStringAsFixed(0).padLeft(4)}, "
-            "w:${obj.width.toStringAsFixed(0).padLeft(3)}, "
-            "h:${obj.height.toStringAsFixed(0).padLeft(3)}, "
-            "r:${(obj.diameter / 2).toStringAsFixed(1).padLeft(4)}");
+        // 이 부분이 호출되어야 CoordinateTransformer의 logTrace가 실행됩니다.
+        // 테스트 중이시라면 레이블을 "TEST_CUP" 등으로 주시면 됩니다.
+        CoordinateTransformer.logTrace("TEST_#LIVE", obj.x, obj.y, obj.z);
       }
     }
 
@@ -555,8 +585,8 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
       Offset mathPos = CoordinateTransformer.transform(tof.x, tof.y, tof.z);
 
       // 2. 🌟 시각적으로 당겨진 좌표 구함 (화면 출력용)
-      Offset visualPos = CoordinateTransformer.applyVisualPull(mathPos);
-      debugPrint("☕ [TRACE] ID:${tof.id} | Math:(${mathPos.dx.toInt()}, ${mathPos.dy.toInt()}) -> Visual:(${visualPos.dx.toInt()}, ${visualPos.dy.toInt()})");
+      Offset visualPos = CoordinateTransformer.applyVisualPull(mathPos, tof.z);
+      //debugPrint("☕ [TRACE] ID:${tof.id} | Math:(${mathPos.dx.toInt()}, ${mathPos.dy.toInt()}) -> Visual:(${visualPos.dx.toInt()}, ${visualPos.dy.toInt()})");
       Color idBasedColor = _getColorForId(tof.id);
       final orderInfo = OrderManager.getOrAssignOrder(tof.id, visualPos, idBasedColor);
 
@@ -1066,6 +1096,7 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
                 onComplete: (data) {
                   // exit 신호는 위 onCalibExit에서 이미 처리됨
                   setState(() => _isCalibrating = false);
+                  CoordinateTransformer.updateResiduals(data.map((p) => p.residual).toList());
                   _processCalibration(data);
                 },
               ),
