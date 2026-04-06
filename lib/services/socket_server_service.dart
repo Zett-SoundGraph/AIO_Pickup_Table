@@ -24,10 +24,9 @@ class SocketServerService {
   // UI로 데이터와 로그를 전달해줄 콜백 함수들
   final Function(String, {bool force}) onLog;
   final Function(TofFrame) onDataReceived;
-  final Function(String subType, dynamic value)? onFineTuneCommand;
   final bool _useIpCheck = false;
   final VoidCallback? onOrderReceived;
-  final VoidCallback? onCalibrationRequested;
+  final Function(double height)? onCalibrationRequested;
   final Function(String? ip)? onClientConnected;
 
   SocketServerService({
@@ -35,7 +34,6 @@ class SocketServerService {
     required this.onDataReceived,
     this.onOrderReceived,
     this.onCalibrationRequested,
-    this.onFineTuneCommand,
     this.onClientConnected,
   });
 
@@ -113,12 +111,12 @@ class SocketServerService {
             return; // 식별 패킷은 여기서 처리 종료
           }
 
-          if (type == 'FINE_TUNE_CONTROL') {
-            final String subType = jsonData['subType'] ?? '';
-            final dynamic value = jsonData['value'];
-            onFineTuneCommand?.call(subType, value);
-            return;
-          }
+          // if (type == 'FINE_TUNE_CONTROL') {
+          //   final String subType = jsonData['subType'] ?? '';
+          //   final dynamic value = jsonData['value'];
+          //   onFineTuneCommand?.call(subType, value);
+          //   return;
+          // }
 
           // 2. KDS 주문 데이터 수신 (기존 유지)
           if (type == 'ORDER_READY') {
@@ -136,8 +134,9 @@ class SocketServerService {
           }
 
           if (type == 'START_CALIBRATION') {
-            onLog("🎯 KDS로부터 원격 캘리브레이션 요청 수신", force: true);
-            onCalibrationRequested?.call(); // 메인 화면으로 신호 전달
+            double incomingHeight = (jsonData['height'] as num?)?.toDouble() ?? 1000.0;
+            debugPrint("🚀 [IPS_DEBUG] KDS Calibration Request: height = $incomingHeight");
+            onCalibrationRequested?.call(incomingHeight);
             return;
           }
 
