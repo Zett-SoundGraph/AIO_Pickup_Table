@@ -11,12 +11,15 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:ml_linalg/matrix.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:ml_linalg/matrix.dart';
+import 'package:ml_linalg/vector.dart';
+import 'package:ml_linalg/dtype.dart';
 
 import '../components/animation_kit.dart';
 import '../components/arc_text_painter.dart';
 import '../components/hand_detection_overlay.dart';
 import '../services/coordinate_transformer.dart';
-import '../services/Polynomial_solver.dart';
+import '../services/homograpy_solver.dart';
 import '../services/order_manager.dart';
 import '../services/socket_server_service.dart';
 import '../models/pickup_data.dart';
@@ -171,30 +174,15 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
     final String? coeffsJson = prefs.getString('polynomial_coeffs');
     if (coeffsJson != null) {
       List<double> coeffs = List<double>.from(jsonDecode(coeffsJson));
-      CoordinateTransformer.setPolynomialCoefficients(coeffs);
+      CoordinateTransformer.setHomographyMatrix(coeffs);
     }
 
-    // final double? savedFL = prefs.getDouble('focal_length');
-    // if (savedFL != null) {
-    //   CoordinateTransformer.focalLength = savedFL;
-    //   debugPrint("✅ [Load] FocalLength restored: $savedFL");
-    // }
-
-    // 2. [추가] 미세 조정 잔차 데이터 불러오기
-    final String? residualJson = prefs.getString('calibration_residuals');
-    if (residualJson != null) {
-      try {
-        List<dynamic> decoded = jsonDecode(residualJson);
-        List<Offset> residuals = decoded.map((item) =>
-            Offset(item['dx'] as double, item['dy'] as double)
-        ).toList();
-
-        CoordinateTransformer.updateResiduals(residuals);
-        //debugPrint("✅ [Load] Calibration Residuals restored.");
-      } catch (e) {
-        //debugPrint("❌ [Error] Residuals load failed: $e");
-      }
+    final double? savedHeight = prefs.getDouble('sensor_height');
+    if (savedHeight != null) {
+      AppConstants.totalSensorHeight = savedHeight;
+      debugPrint("📏 저장된 설치 높이 복구 완료: ${savedHeight}mm");
     }
+
     setState(() {
       _irValue = prefs.getInt('ir_value') ?? 51;
       _lastSentIrValue = _irValue;
@@ -344,21 +332,26 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
       final zValues = data.map((e) => e.z).toList(); // 🌟 Z값 리스트 추가
       final dstPoints = data.map((e) => Point(e.dst.dx, e.dst.dy)).toList();
 
-      // 2. 솔버 호출 (zValues 전달)
-      var results = PolynomialSolver.solveAll(srcPoints, zValues, dstPoints);
+      final List<double> hMatrix = HomographySolver.solve(srcPoints, zValues, dstPoints);
 
-      List<double> fwd = results['forward']!;
-      List<double> inv = results['inverse']!;
-
-      // 2. Transformer 업데이트 및 저장
-      CoordinateTransformer.setPolynomialCoefficients(fwd);
+      CoordinateTransformer.setHomographyMatrix(hMatrix);
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('polynomial_coeffs', jsonEncode(fwd));
+      // 키 이름은 기존과 유지해도 되지만, 데이터는 9개만 저장됩니다.
+      await prefs.setString('polynomial_coeffs', jsonEncode(hMatrix));
+      debugPrint("✅ [Save] 호모그래피 행렬 저장 완료");
 
-      // 3. ROI 역산 로직
-      // double invParallaxRatio = AppConstants.totalSensorHeight / (AppConstants.totalSensorHeight - 110.0);
-      double invParallaxRatio = 1.25;
-      debugPrint("📊 [ROI_DEBUG] 시차 역산 배율: ${invParallaxRatio.toStringAsFixed(3)}");
+      await prefs.setDouble('sensor_height', AppConstants.totalSensorHeight);
+
+      // 4. ROI 역산을 위한 행렬 구성 및 역행렬 계산
+      // ml_linalg를 사용하여 3x3 행렬 생성
+      final Matrix H = Matrix.fromList([
+        [hMatrix[0], hMatrix[1], hMatrix[2]],
+        [hMatrix[3], hMatrix[4], hMatrix[5]],
+        [hMatrix[6], hMatrix[7], hMatrix[8]],
+      ], dtype: DType.float64);
+
+      // 역행렬(H_inv)을 구하면 UI좌표 -> 바닥센서좌표 역산이 가능합니다.
+      final Matrix H_inv = H.inverse();
 
       final List<Map<String, dynamic>> roiConfigs = [
         {"id": 1, "name": "Top-Left", "pos": const Offset(0, 0)},
@@ -370,35 +363,62 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
 
       List<Map<String, dynamic>> roiPoints = [];
 
+      double invParallaxRatio = 1.0;
+
       for (var config in roiConfigs) {
-        double ux = config["pos"]!.dx / 1920.0; // UI 정규화
-        double uy = config["pos"]!.dy / 1080.0;
+        final Offset uiPos = config["pos"] as Offset;
 
-        // 역방향 다항식 적용 (결과: 정규화된 센서지면)
-        double ngx = inv[0] + inv[1]*ux + inv[2]*uy + inv[3]*ux*uy + inv[4]*ux*ux + inv[5]*uy*uy;
-        double ngy = inv[6] + inv[7]*ux + inv[8]*uy + inv[9]*ux*uy + inv[10]*ux*ux + inv[11]*uy*uy;
+        // 1. Homography 역행렬을 통해 '바닥 좌표(gx, gy)' 계산
+        final Matrix uiMatrix = Matrix.fromList([[uiPos.dx], [uiPos.dy], [1.0]], dtype: DType.float64);
+        final Matrix resultMatrix = H_inv * uiMatrix;
+        final List<double> sensorFloorVec = resultMatrix.getColumn(0).toList();
 
-        // 정규화 해제 (0~1 -> 0~640)
-        double gx = ngx * 640.0;
-        double gy = ngy * 480.0;
+        double wPrime = sensorFloorVec[2];
+        if (wPrime == 0) wPrime = 1.0;
 
-        // 시차 보정 역산 (바닥 -> 센서 윗면)
-        double rawX = 320.0 + (gx - 320.0) * invParallaxRatio;
-        double rawY = 240.0 + (gy - 240.0) * invParallaxRatio;
+        // 4. 최종 센서 좌표 (비선형 보정을 모두 뺀 순수 변환값)
+        double finalX = sensorFloorVec[0] / wPrime;
+        double finalY = sensorFloorVec[1] / wPrime;
 
-        // 최종 클램핑
-        double finalX = rawX.clamp(0.0, 640.0);
-        double finalY = rawY.clamp(0.0, 480.0);
+        // 센서 해상도(640x480) 밖으로 나가지 않게 최소한의 방어만 수행
+        finalX = finalX.clamp(0.0, 640.0);
+        finalY = finalY.clamp(0.0, 480.0);
 
-        debugPrint("📍 [ROI_DEBUG] ${config['name']}: "
-            "UI(${config['pos']!.dx.toInt()}, ${config['pos']!.dy.toInt()}) "
-            "-> Raw(${finalX.toStringAsFixed(1)}, ${finalY.toStringAsFixed(1)})");
+        debugPrint("📍 [ROI_FINAL] ${config['name']}: UI(${uiPos.dx.toInt()}, ${uiPos.dy.toInt()}) -> Raw(${finalX.toStringAsFixed(1)}, ${finalY.toStringAsFixed(1)})");
 
         roiPoints.add({
           "id": config["id"],
           "x": finalX,
           "y": finalY,
         });
+        // double wPrime = sensorFloorVec[2] != 0 ? sensorFloorVec[2] : 1.0;
+        // double gx = sensorFloorVec[0] / wPrime;
+        // double gy = sensorFloorVec[1] / wPrime;
+        //
+        // double dxFloor = gx - 320.0;
+        // double dyFloor = gy - 240.0;
+        //
+        // double fx = 620.0;
+        // double fy = 620.0;
+        //
+        // // 현재 위치에서의 굴절 계수 계산
+        // double projFactor = math.sqrt(1 + math.pow(dxFloor / fx, 2) + math.pow(dyFloor / fy, 2));
+        //
+        // // Raw 좌표로 복원 (시차 및 굴절 역보정)
+        // double finalX = 320.0 + (dxFloor * projFactor);
+        // double finalY = 240.0 + (dyFloor * projFactor);
+        //
+        // // 3. 클램핑 및 데이터 생성
+        // finalX = finalX.clamp(0.0, 640.0);
+        // finalY = finalY.clamp(0.0, 480.0);
+        //
+        // debugPrint("📍 [ROI_FIXED] ${config['name']}: UI(${uiPos.dx}, ${uiPos.dy}) -> Raw(${finalX.toStringAsFixed(1)}, ${finalY.toStringAsFixed(1)})");
+        //
+        // roiPoints.add({
+        //   "id": config["id"],
+        //   "x": finalX,
+        //   "y": finalY,
+        // });
       }
 
       // 4. 전송
@@ -432,37 +452,17 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
         onOrderReceived: () {
           if (mounted) setState(() => _updateGuidePositions());
         },
-        onCalibrationRequested: () {
+        onCalibrationRequested: (double incomingHeight) {
           if (!mounted) return;
           setState(() {
+            AppConstants.totalSensorHeight = incomingHeight;
+            debugPrint("✅ [HEIGHT_CHECK] AppConstants.totalSensorHeight is now: ${AppConstants.totalSensorHeight}");
             CoordinateTransformer.resetMatrix();
             // 센서(RPi)에게도 캘리브레이션 모드임을 알림
             _serverService
                 .sendMessage(jsonEncode({"event_type": "cal_restart"}));
             _isCalibrating = true;
           });
-        },
-
-        onFineTuneCommand: (subType, value) {
-          if (!_isCalibrating) return;
-
-          switch (subType) {
-            case 'START':
-              _calibKey.currentState?.externalEnterFineTune();
-              break;
-            case 'SELECT':
-              _calibKey.currentState?.externalSelectPoint(value as int);
-              break;
-            case 'MOVE':
-              double dx = (value['dx'] as num).toDouble();
-              double dy = (value['dy'] as num).toDouble();
-              _calibKey.currentState?.externalAdjust(dx, dy);
-              break;
-            case 'COMPLETE':
-              _calibKey.currentState?.externalComplete();
-              _serverService.sendToRole("KDS", jsonEncode({"type": "VALIDATION_MODE"}));
-              break;
-          }
         },
         onDataReceived: (TofFrame frame) {
           // if (frame.baseZ != null) {
@@ -471,7 +471,7 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
           if (frame.objects.isNotEmpty) {
             var obj = frame.objects.first;
             setState(() {
-              _latestRawForCalib = CoordinateTransformer.getFixedParallax(obj.x, obj.y, obj.z);
+              _latestRawForCalib = CoordinateTransformer.getFloorProjectedOffset(obj.x, obj.y, obj.z);
               _lastFrameObjects = frame.objects;
             });
           }
@@ -514,7 +514,7 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
       if (!_isHandDetected) {
         setState(() => _isHandDetected = true);
       }
-      _currentLatestFrameId = frame.frameId; // 현재 프레임 ID 업데이트 (로그 색상 강조용)
+      _currentLatestFrameId = frame.frameId;
 
       // 손 데이터 변환 및 저장
       hands = frame.objects.map((tof) {
@@ -534,19 +534,41 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
 
   // 1. _processCupUpdate 수정 버전
   void _processCupUpdate(TofFrame frame) {
-    final validTofObjects = frame.objects.where((obj) => obj.x > 5 && obj.y > 5).toList();
+    //final validTofObjects = frame.objects.where((obj) => obj.x > 5 && obj.y > 5).toList();
+    /// 손을 인식하는 문제 일단 반지름이 큰 물체는 거부하도록 임시 대체
+    final validTofObjects = frame.objects.where((obj) {
+      double radius = obj.diameter / 2;
 
+      // 위치가 유효한지 확인
+      bool isValidPos = obj.x > 5 && obj.y > 5;
+      // 반지름이 80mm 이하인지 확인 (사용자님 요청사항)
+      bool isNormalSize = radius <= 80;
+
+      if (!isNormalSize) {
+        //debugPrint("🚫 [FILTER] 거대 노이즈 차단: ID:${obj.id} | r:${radius.toStringAsFixed(1)}mm");
+      }
+
+      return isValidPos && isNormalSize;
+    }).toList();
+
+    // if (validTofObjects.isNotEmpty) {
+    //   debugPrint("☕ [RAW_CUP_FRAME] ID:${frame.frameId}");
+    //   for (var obj in validTofObjects) {
+    //     CoordinateTransformer.logTrace("LIVE_CUP_${obj.id}", obj.x, obj.y, obj.z);
+    //     debugPrint("   > [ID:${obj.id.toString().padLeft(3)}] "
+    //         "x:${obj.x.toStringAsFixed(0).padLeft(3)}, "
+    //         "y:${obj.y.toStringAsFixed(0).padLeft(3)}, "
+    //         "z:${obj.z.toStringAsFixed(0).padLeft(4)}, "
+    //         "w:${obj.width.toStringAsFixed(0).padLeft(3)}, "
+    //         "h:${obj.height.toStringAsFixed(0).padLeft(3)}, "
+    //         "r:${(obj.diameter / 2).toStringAsFixed(1).padLeft(4)}");
+    //   }
+    // }
     if (validTofObjects.isNotEmpty) {
-      debugPrint("☕ [RAW_CUP_FRAME] ID:${frame.frameId}");
       for (var obj in validTofObjects) {
-        CoordinateTransformer.logTrace("LIVE_CUP_${obj.id}", obj.x, obj.y, obj.z);
-        debugPrint("   > [ID:${obj.id.toString().padLeft(3)}] "
-            "x:${obj.x.toStringAsFixed(0).padLeft(3)}, "
-            "y:${obj.y.toStringAsFixed(0).padLeft(3)}, "
-            "z:${obj.z.toStringAsFixed(0).padLeft(4)}, "
-            "w:${obj.width.toStringAsFixed(0).padLeft(3)}, "
-            "h:${obj.height.toStringAsFixed(0).padLeft(3)}, "
-            "r:${(obj.diameter / 2).toStringAsFixed(1).padLeft(4)}");
+        // 이 부분이 호출되어야 CoordinateTransformer의 logTrace가 실행됩니다.
+        // 테스트 중이시라면 레이블을 "TEST_CUP" 등으로 주시면 됩니다.
+        CoordinateTransformer.logTrace("TEST_#LIVE", obj.x, obj.y, obj.z);
       }
     }
 
@@ -555,8 +577,8 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
       Offset mathPos = CoordinateTransformer.transform(tof.x, tof.y, tof.z);
 
       // 2. 🌟 시각적으로 당겨진 좌표 구함 (화면 출력용)
-      Offset visualPos = CoordinateTransformer.applyVisualPull(mathPos);
-      debugPrint("☕ [TRACE] ID:${tof.id} | Math:(${mathPos.dx.toInt()}, ${mathPos.dy.toInt()}) -> Visual:(${visualPos.dx.toInt()}, ${visualPos.dy.toInt()})");
+      Offset visualPos = mathPos;
+      //debugPrint("☕ [TRACE] ID:${tof.id} | Math:(${mathPos.dx.toInt()}, ${mathPos.dy.toInt()}) -> Visual:(${visualPos.dx.toInt()}, ${visualPos.dy.toInt()})");
       Color idBasedColor = _getColorForId(tof.id);
       final orderInfo = OrderManager.getOrAssignOrder(tof.id, visualPos, idBasedColor);
 
@@ -844,10 +866,10 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
                         duration: const Duration(seconds: 1),
                         builder: (context, val, child) {
                           return Opacity(
-                            opacity: val * 0.5, // 이미지 가독성을 위해 0.5 정도 투명도 유지 (조절 가능)
+                            opacity: val * 0.5,
                             child: OrderGuideWidget(
                               label: label,
-                              color: Colors.white, // 원하는 색상 지정 가능
+                              color: Colors.white,
                               icons: _iconImages,
                             ),
                           );
@@ -863,7 +885,6 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
               child: HandDetectionOverlay(visible: _isHandDetected),
             ),
 
-            // (디버깅용) 우측 상단 포트 정보
             Positioned(
               top: 40,
               right: 20,
@@ -887,7 +908,6 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      // 헤더: 제목 + 스위치 + 닫기
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
@@ -1052,9 +1072,6 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
                 onValidationEntered: () {
                   _serverService.sendToRole("KDS", jsonEncode({"type": "VALIDATION_MODE"}));
                 },
-                onEnterFineTune: () {
-                  _serverService.sendToRole("KDS", jsonEncode({"type": "ENTER_FINE_TUNE"}));
-                },
                 onCalibExit: () {
                   _serverService.sendToRole("KDS", jsonEncode({"type": "CALIB_EXIT"}));
                 },
@@ -1066,6 +1083,7 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
                 onComplete: (data) {
                   // exit 신호는 위 onCalibExit에서 이미 처리됨
                   setState(() => _isCalibrating = false);
+                  //CoordinateTransformer.updateResiduals(data.map((p) => p.residual).toList());
                   _processCalibration(data);
                 },
               ),
