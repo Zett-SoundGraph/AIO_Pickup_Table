@@ -120,14 +120,16 @@ class SocketServerService {
 
           // 2. KDS 주문 데이터 수신 (기존 유지)
           if (type == 'ORDER_READY') {
-            onLog("📢 KDS 주문 수신: ${jsonData['orderNo']}번");
+            int total = jsonData['totalRequired'] ?? (jsonData['drinkCount'] ?? 0) + (jsonData['foodCount'] ?? 0) + (jsonData['bottleCount'] ?? 0);
+            onLog("📢 KDS 주문 수신: ${jsonData['orderNo']}번 (총 $total 잔 요구됨)");
             OrderManager.addReadyOrder(
                 jsonData['orderNo'].toString(),
                 jsonData['menuName'] ?? "메뉴명 없음",
                 jsonData['nickname'] ?? "",
                 jsonData['drinkCount'] ?? 0,
                 jsonData['foodCount'] ?? 0,
-                jsonData['bottleCount'] ?? 0
+                jsonData['bottleCount'] ?? 0,
+                total
             );
             onOrderReceived?.call();
             return;
