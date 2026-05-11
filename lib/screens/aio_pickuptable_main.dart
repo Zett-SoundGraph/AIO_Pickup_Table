@@ -372,7 +372,6 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
         final Matrix uiMatrix = Matrix.fromList([[uiPos.dx], [uiPos.dy], [1.0]], dtype: DType.float64);
         final Matrix resultMatrix = H_inv * uiMatrix;
         final List<double> sensorFloorVec = resultMatrix.getColumn(0).toList();
-
         double wPrime = sensorFloorVec[2];
         if (wPrime == 0) wPrime = 1.0;
 
@@ -534,22 +533,17 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
 
   // 1. _processCupUpdate 수정 버전
   void _processCupUpdate(TofFrame frame) {
-    //final validTofObjects = frame.objects.where((obj) => obj.x > 5 && obj.y > 5).toList();
-    /// 손을 인식하는 문제 일단 반지름이 큰 물체는 거부하도록 임시 대체
-    final validTofObjects = frame.objects.where((obj) {
-      double radius = obj.diameter / 2;
+    final validTofObjects = frame.objects.where((obj) => obj.x > 5 && obj.y > 5).toList();
+    // /// 손을 인식하는 문제 일단 반지름이 큰 물체는 거부하도록 임시 대체
+    // final validTofObjects = frame.objects.where((obj) {
+    //   // 위치가 유효한지(0,0 근처 노이즈 제외)만 확인합니다.
+    //   bool isValidPos = obj.x > 5 && obj.y > 5;
+    //
+    //   // [기존 코드 삭제]: bool isNormalSize = radius <= 80;
+    //   // 이제 ROI가 안정적이므로 크기에 상관없이 모든 객체를 수용합니다.
+    //   return isValidPos;
+    // }).toList();
 
-      // 위치가 유효한지 확인
-      bool isValidPos = obj.x > 5 && obj.y > 5;
-      // 반지름이 80mm 이하인지 확인 (사용자님 요청사항)
-      bool isNormalSize = radius <= 80;
-
-      if (!isNormalSize) {
-        //debugPrint("🚫 [FILTER] 거대 노이즈 차단: ID:${obj.id} | r:${radius.toStringAsFixed(1)}mm");
-      }
-
-      return isValidPos && isNormalSize;
-    }).toList();
 
     // if (validTofObjects.isNotEmpty) {
     //   debugPrint("☕ [RAW_CUP_FRAME] ID:${frame.frameId}");
@@ -580,7 +574,7 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
       Offset visualPos = mathPos;
       //debugPrint("☕ [TRACE] ID:${tof.id} | Math:(${mathPos.dx.toInt()}, ${mathPos.dy.toInt()}) -> Visual:(${visualPos.dx.toInt()}, ${visualPos.dy.toInt()})");
       Color idBasedColor = _getColorForId(tof.id);
-      final orderInfo = OrderManager.getOrAssignOrder(tof.id, visualPos, idBasedColor);
+      final orderInfo = OrderManager.getOrAssignOrder(tof.id, visualPos, idBasedColor, tof.diameter);
 
       String displayLabel = "UNKNOWN"; // 기본값
       if (orderInfo != null) {
@@ -854,13 +848,23 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
                 children: [
                   ..._guidePositions.entries.map((entry) {
                     Offset pos = entry.value;
-                    String label = _getGuideLabel(entry.key);
+                    // String label = _getGuideLabel(entry.key);
+                    final orderData = OrderManager.waitingQueue.firstWhere(
+                          (o) => o['orderNo'] == entry.key,
+                      orElse: () => {'orderNo': entry.key, 'nickname': '', 'totalRequired': 1},
+                    );
+                    String label = _buildComplexLabel(orderData);
+                    int totalCups = orderData['totalRequired'] ?? 1;
+
+                    // 2. 가이드 크기 변화에 따른 중앙 Offset 동적 보정 (180, 240, 300)
+                    double widgetSize = 180.0 + ((totalCups - 1) * 60.0);
+                    double offsetCorrection = widgetSize / 2;
                     return AnimatedPositioned(
                       key: ValueKey("guide_${entry.key}"),
                       duration: const Duration(milliseconds: 500),
                       curve: Curves.easeInOut,
-                      left: pos.dx - 90,
-                      top: pos.dy - 90,
+                      left: pos.dx - offsetCorrection,
+                      top: pos.dy - offsetCorrection,
                       child: TweenAnimationBuilder<double>(
                         tween: Tween(begin: 0.0, end: 1.0),
                         duration: const Duration(seconds: 1),
@@ -871,6 +875,7 @@ class _AioPickupTableMainState extends State<AioPickupTableMain> {
                               label: label,
                               color: Colors.white,
                               icons: _iconImages,
+                              totalCups: totalCups,
                             ),
                           );
                         },
